@@ -41,7 +41,7 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_launch
-from omnigent.server.schemas import SessionGitOptions
+from omnigent.server.schemas import SessionGitOptions, SessionWorktreePoolOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -59,6 +59,9 @@ _LIST_DIR_MAX_LIMIT = 1000
 # fast syscall on the host side; 5s matches list_dir and is generous
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
+_WORKTREE_POOL_LEASE_LABEL = "omnigent.worktree_pool.lease_id"
+_WORKTREE_POOL_ID_LABEL = "omnigent.worktree_pool.id"
+_WORKTREE_POOL_SLOT_LABEL = "omnigent.worktree_pool.slot_id"
 
 
 async def _proxy_list_dir(
@@ -229,6 +232,14 @@ class LaunchRunnerRequest(BaseModel):
     session_id: str
     workspace: str
     git: SessionGitOptions | None = None
+
+
+class ConfigureWorktreePoolRequest(BaseModel):
+    """Request body for ``POST /v1/hosts/{host_id}/worktree-pools``."""
+
+    repo_path: str
+    base_branch: str
+    pool: SessionWorktreePoolOptions
 
 
 async def _resolve_agent_spec_cwd(
@@ -479,6 +490,9 @@ def create_hosts_router(
                 body.session_id,
             )
 
+        binding_token = secrets.token_urlsafe(32)
+        runner_id = token_bound_runner_id(binding_token)
+
         # Optional git worktree: when the caller asks to branch, create a
         # worktree off the validated source repo and bind the runner to
         # the worktree path instead (the fork-resume path; mirrors
@@ -490,6 +504,7 @@ def create_hosts_router(
         # (create mode). Left None in bind mode so the rollback below never
         # force-removes the user's pre-existing worktree.
         worktree = None
+        pool_lease = None
         if body.git is not None:
             from omnigent.host.git_worktree import (
                 WorktreeError,
@@ -508,6 +523,33 @@ def create_hosts_router(
                 # but record its branch so the sidebar shows it and the opt-in
                 # delete flow can offer to remove it.
                 git_branch = body.git.branch_name
+            elif body.git.pool is not None:
+                from omnigent.server.routes._host_worktree_pool import (
+                    WorktreePoolHostUnavailableError,
+                    WorktreePoolProxyError,
+                    acquire_worktree_on_host,
+                )
+
+                try:
+                    assert body.git.base_branch is not None
+                    pool_lease = await acquire_worktree_on_host(
+                        host_registry=host_registry,
+                        host_conn=conn,
+                        repo_path=workspace,
+                        base_branch=body.git.base_branch,
+                        target_size=body.git.pool.target_size,
+                        pool_id=body.git.pool.pool_id,
+                        branch_name=body.git.branch_name,
+                        session_id=body.session_id,
+                        runner_id=runner_id,
+                    )
+                except WorktreePoolHostUnavailableError as exc:
+                    raise HTTPException(status_code=409, detail=exc.message) from exc
+                except WorktreePoolProxyError as exc:
+                    status_code = 409 if "no available slots" in exc.message else 400
+                    raise HTTPException(status_code=status_code, detail=exc.message) from exc
+                workspace = pool_lease.worktree_path
+                git_branch = pool_lease.branch
             else:
                 from omnigent.server.routes._host_worktree import (
                     WorktreeHostUnavailableError,
@@ -566,6 +608,30 @@ def create_hosts_router(
                     exc_info=True,
                 )
 
+        async def _rollback_pool_lease() -> None:
+            """Best-effort release of the pool lease acquired above."""
+            if pool_lease is None:
+                return
+            from omnigent.server.routes._host_worktree_pool import (
+                WorktreePoolProxyError,
+                release_worktree_on_host,
+            )
+
+            try:
+                await release_worktree_on_host(
+                    host_registry=host_registry,
+                    host_conn=conn,
+                    lease_id=pool_lease.lease_id,
+                    delete_branch=True,
+                )
+            except WorktreePoolProxyError:
+                _logger.warning(
+                    "Best-effort worktree pool release failed for session %s (%s)",
+                    body.session_id,
+                    pool_lease.lease_id,
+                    exc_info=True,
+                )
+
         async def _rollback_failed_launch() -> None:
             """
             Undo a failed launch *after* the runner was atomically bound.
@@ -586,9 +652,7 @@ def create_hosts_router(
             """
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             await _rollback_worktree()
-
-        binding_token = secrets.token_urlsafe(32)
-        runner_id = token_bound_runner_id(binding_token)
+            await _rollback_pool_lease()
 
         # Atomic bind (UPDATE ... WHERE runner_id IS NULL): only one
         # concurrent launch can bind an unbound session; a second (or an
@@ -600,6 +664,7 @@ def create_hosts_router(
         )
         if not bound:
             await _rollback_worktree()
+            await _rollback_pool_lease()
             raise HTTPException(
                 status_code=400,
                 detail="session already has a runner bound",
@@ -617,6 +682,16 @@ def create_hosts_router(
             workspace,
             git_branch,
         )
+        if pool_lease is not None:
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                body.session_id,
+                {
+                    _WORKTREE_POOL_LEASE_LABEL: pool_lease.lease_id,
+                    _WORKTREE_POOL_ID_LABEL: pool_lease.pool_id,
+                    _WORKTREE_POOL_SLOT_LABEL: pool_lease.slot_id,
+                },
+            )
 
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
@@ -998,5 +1073,67 @@ def create_hosts_router(
             raise HTTPException(status_code=400, detail=exc.message) from exc
 
         return {"object": "list", "data": worktrees}
+
+    @router.post("/hosts/{host_id}/worktree-pools")
+    async def configure_host_worktree_pool(
+        request: Request,
+        host_id: str,
+        body: ConfigureWorktreePoolRequest,
+    ) -> dict[str, Any]:
+        """
+        Precreate and reconcile a fixed-size git worktree pool on a host.
+
+        The pool is host-owned and fixed-capacity: configuring with
+        ``target_size=N`` ensures N slots exist for the requested
+        ``repo_path``/``base_branch``/``pool_id``. Later runner launches
+        with matching ``git.pool`` lease one of those slots instead of
+        creating unbounded session worktrees.
+        """
+        from omnigent.server.routes._host_worktree_pool import (
+            WorktreePoolHostUnavailableError,
+            WorktreePoolProxyError,
+            configure_worktree_pool_on_host,
+        )
+
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.owner != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        if not body.repo_path.strip():
+            raise HTTPException(status_code=400, detail="repo_path must not be empty")
+        if "\x00" in body.repo_path:
+            raise HTTPException(status_code=400, detail="repo_path must not contain NUL bytes")
+        if not body.base_branch.strip():
+            raise HTTPException(status_code=400, detail="base_branch must not be empty")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        try:
+            status = await configure_worktree_pool_on_host(
+                host_registry=host_registry,
+                host_conn=conn,
+                repo_path=body.repo_path,
+                base_branch=body.base_branch,
+                target_size=body.pool.target_size,
+                pool_id=body.pool.pool_id,
+            )
+        except WorktreePoolHostUnavailableError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+        except WorktreePoolProxyError as exc:
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+
+        return {
+            "object": "worktree_pool",
+            "pool_id": status.pool_id,
+            "target_size": status.target_size,
+            "total_slots": status.total_slots,
+            "idle_slots": status.idle_slots,
+        }
 
     return router

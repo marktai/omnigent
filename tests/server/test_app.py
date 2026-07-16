@@ -66,6 +66,23 @@ def test_server_version_reads_version_constant() -> None:
     assert server_app._server_version() == VERSION
 
 
+def test_worktree_pool_idle_eviction_timeout_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worktree-pool eviction timeout is tunable for local e2e tests."""
+    monkeypatch.delenv(server_app._WORKTREE_POOL_IDLE_EVICTION_ENV, raising=False)
+    assert server_app._worktree_pool_idle_eviction_s() == 3600
+
+    monkeypatch.setenv(server_app._WORKTREE_POOL_IDLE_EVICTION_ENV, "2")
+    assert server_app._worktree_pool_idle_eviction_s() == 2
+
+    monkeypatch.setenv(server_app._WORKTREE_POOL_IDLE_EVICTION_ENV, "bad")
+    assert server_app._worktree_pool_idle_eviction_s() == 3600
+
+    monkeypatch.setenv(server_app._WORKTREE_POOL_IDLE_EVICTION_ENV, "-1")
+    assert server_app._worktree_pool_idle_eviction_s() == 3600
+
+
 class _StubWebSocket:
     """
     Minimal real ``WebSocketLike`` for registering a runner tunnel.
