@@ -69,6 +69,29 @@ _CODEX_GOAL_MIN_VERSION = (0, 139, 0)
 _PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
 
 
+def _write_e2e_mock_provider_config(config_home: Path, mock_llm_server_url: str) -> None:
+    """Write pytest-local provider config for browser E2E subprocesses."""
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "config.yaml").write_text(
+        textwrap.dedent(
+            f"""\
+            providers:
+              openai-e2e-mock:
+                kind: key
+                default: [openai]
+                openai:
+                  base_url: "{mock_llm_server_url}/v1"
+                  api_key: "mock-key"
+                  wire_api: responses
+                  models:
+                    default: gpt-4o-mini
+            dismissed_detections:
+              - codex-databricks
+            """
+        )
+    )
+
+
 def open_right_rail(page: Page) -> None:
     """Expand the right "Workspace" rail if it is collapsed.
 
@@ -872,9 +895,12 @@ def live_server(
     # OMNIGENT_RUNNER_TUNNEL_TOKEN lets the server accept
     # exactly the sibling runner's WebSocket tunnel.
     mock_url = mock_llm_server_url
+    config_home = server_tmp / "config-home"
+    _write_e2e_mock_provider_config(config_home, mock_url)
     env = {
         **os.environ,
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        "OMNIGENT_CONFIG_HOME": str(config_home),
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         "OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(builtin_dirs),
         # Point the openai-agents harness at the mock LLM server so no
@@ -926,6 +952,7 @@ def live_server(
     runner_env = {
         **os.environ,
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        "OMNIGENT_CONFIG_HOME": str(config_home),
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
@@ -1006,6 +1033,7 @@ def live_server(
     _server_state["binding_token"] = binding_token
     _server_state["server_url"] = base_url
     _server_state["mock_llm_url"] = mock_url
+    _server_state["config_home"] = str(config_home)
 
     # Set a non-resettable fallback for the policy-classifier LLM queue so
     # every per-test reset leaves the server's guardrails path functional.
@@ -1175,6 +1203,7 @@ def _ensure_runner_online(
 
     binding_token = str(_server_state["binding_token"])
     mock_url = str(_server_state.get("mock_llm_url", ""))
+    config_home = str(_server_state.get("config_home", ""))
     runner_tmp = tmp_path_factory.mktemp("e2e_ui_respawn_runner")
     log_path = runner_tmp / "runner.log"
     log_handle = open(log_path, "w")  # noqa: SIM115 — fd dup'd into child; closed below
@@ -1185,6 +1214,7 @@ def _ensure_runner_online(
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
         "RUNNER_SERVER_URL": base_url,
+        **({"OMNIGENT_CONFIG_HOME": config_home} if config_home else {}),
         # Mirror the live_server runner's mock-LLM routing so the
         # respawned runner's harness also hits the mock.
         **(
@@ -1881,7 +1911,7 @@ def server_pid(live_server: str) -> int:
 # 1 + executor.config.harness routes through the strict parser; arcname
 # config.yaml keeps it on that path.
 _CUSTOM_AGENT_NAME = "echo_probe"
-_CLAUDE_MOCK_MODEL = "claude-3-5-sonnet-20241022"
+_CLAUDE_MOCK_MODEL = "sonnet"
 _CODEX_MOCK_MODEL = "gpt-4o"
 _CUSTOM_AGENT_YAML = f"""\
 spec_version: 1
@@ -2262,7 +2292,8 @@ def _temp_omnigent_mock_config(
         ``"http://127.0.0.1:51235"``. No /v1 suffix — each SDK appends it.
     :param harness: ``"claude"`` or ``"codex"``.
     """
-    config_dir = Path.home() / ".omnigent"
+    config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
+    config_dir = Path(config_home) if config_home else Path.home() / ".omnigent"
     config_path = config_dir / "config.yaml"
     config_dir.mkdir(parents=True, exist_ok=True)
     original = config_path.read_text() if config_path.exists() else None
@@ -2278,6 +2309,8 @@ def _temp_omnigent_mock_config(
                   api_key: "mock-key"
                   models:
                     default: {_CLAUDE_MOCK_MODEL}
+            dismissed_detections:
+              - codex-databricks
             """)
     else:  # codex
         mock_config = textwrap.dedent(f"""\
@@ -2291,6 +2324,8 @@ def _temp_omnigent_mock_config(
                   wire_api: responses
                   models:
                     default: {_CODEX_MOCK_MODEL}
+            dismissed_detections:
+              - codex-databricks
             """)
 
     config_path.write_text(mock_config)

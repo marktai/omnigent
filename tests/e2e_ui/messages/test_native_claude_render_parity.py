@@ -55,7 +55,7 @@ _TERMINAL_READY_TIMEOUT_MS = 120_000
 
 # Must match the model set in the mock anthropic provider config written by the
 # native_claude_mock_session fixture (conftest._CLAUDE_MOCK_MODEL).
-_CLAUDE_MOCK_MODEL = "claude-3-5-sonnet-20241022"
+_CLAUDE_MOCK_MODEL = "sonnet"
 
 # Two composer turns (the IN direction) + one TUI turn (the OUT direction).
 _COMPOSER_TURNS = 2
