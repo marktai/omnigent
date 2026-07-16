@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import secrets
+import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -208,14 +210,15 @@ class WorktreePoolManager:
         _ensure_base(repo_root, base_branch)
         for args in (["merge", "--abort"], ["rebase", "--abort"]):
             _run_git(args, cwd=str(slot_path))
-        for args in (
-            ["reset", "--hard"],
-            ["clean", "-ffd"],
+        _remove_stale_index_lock_if_safe(str(slot_path))
+        _run_git_with_lock_recovery(["reset", "--hard"], cwd=str(slot_path))
+        clean = _run_git(["clean", "-ffd"], cwd=str(slot_path))
+        if clean.returncode != 0:
+            raise _git_error("git clean -ffd failed", clean)
+        _run_git_with_lock_recovery(
             ["checkout", "--detach", "--end-of-options", base_branch],
-        ):
-            result = _run_git(args, cwd=str(slot_path))
-            if result.returncode != 0:
-                raise _git_error(f"git {' '.join(args)} failed", result)
+            cwd=str(slot_path),
+        )
 
     def _finalize_branch_before_cleanup(self, lease: _Lease) -> None:
         """Commit and push dirty branch work before destructive cleanup."""
@@ -244,9 +247,7 @@ class WorktreePoolManager:
                 "cannot finalize dirty pool slot: remote 'origin' is not configured"
             )
 
-        add = _run_git(["add", "-A"], cwd=worktree_path)
-        if add.returncode != 0:
-            raise _git_error("git add failed", add)
+        _run_git_with_lock_recovery(["add", "-A"], cwd=worktree_path)
 
         staged = _run_git(["diff", "--cached", "--quiet"], cwd=worktree_path)
         if staged.returncode == 0:
@@ -314,3 +315,68 @@ def _slot_paths(repo_root: str, pool_id: str, target_size: int) -> list[tuple[st
 
 def _prune_worktrees(repo_root: str) -> None:
     _run_git(["worktree", "prune"], cwd=repo_root)
+
+
+def _run_git_with_lock_recovery(
+    args: list[str],
+    *,
+    cwd: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run git once, remove a safe stale index lock, then retry once."""
+    result = _run_git(args, cwd=cwd)
+    if result.returncode == 0:
+        return result
+    _remove_stale_index_lock_if_safe(cwd)
+    result = _run_git(args, cwd=cwd)
+    if result.returncode != 0:
+        raise _git_error(f"git {' '.join(args)} failed", result)
+    return result
+
+
+def _remove_stale_index_lock_if_safe(cwd: str) -> None:
+    lock_path = _index_lock_path(cwd)
+    if not lock_path.exists():
+        return
+    if _git_processes_active():
+        raise WorktreeError(
+            f"git index lock exists and git processes are active; refusing to remove {lock_path}"
+        )
+    lock_path.unlink()
+
+
+def _index_lock_path(cwd: str) -> Path:
+    result = _run_git(["rev-parse", "--absolute-git-dir"], cwd=cwd)
+    if result.returncode != 0:
+        raise _git_error("git rev-parse --absolute-git-dir failed", result)
+    git_dir = Path(result.stdout.strip())
+    return git_dir / "index.lock"
+
+
+def _git_processes_active() -> bool:
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,comm=,args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return True
+    if result.returncode != 0:
+        return True
+    current_pid = str(os.getpid())
+    for line in result.stdout.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 2:
+            continue
+        if fields[0] == current_pid:
+            continue
+        command = Path(fields[1]).name
+        if command == "git" or command.startswith("git-"):
+            return True
+        if len(fields) == 3:
+            argv0 = Path(fields[2].split()[0]).name if fields[2].split() else ""
+            if argv0 == "git" or argv0.startswith("git-"):
+                return True
+    return False

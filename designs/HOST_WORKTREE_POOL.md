@@ -2,10 +2,11 @@
 
 ## Context
 
-Isaac's Arca agent uses one long-lived agent process per git worktree. A task is
-claimed by an agent that already owns a clean checkout, the agent prepares that
-checkout for the task branch, runs the model, commits and pushes, then restores
-the checkout to a detached base for reuse.
+Long-running coding agents need predictable checkout isolation without creating
+unbounded git worktrees. A host-managed pool gives the host a fixed number of
+clean, reusable worktree slots. Each runner leases one slot, works on a session
+branch inside that slot, and later releases it back to the pool after any dirty
+branch work is finalized.
 
 Omnigent already has host-side git worktree support, but it is session scoped:
 
@@ -23,14 +24,13 @@ Omnigent already has host-side git worktree support, but it is session scoped:
 The current system can create one worktree per session. It does not yet keep a
 bounded pool of reusable worktrees or assign runners to idle pool slots.
 
-## Isaac behavior to copy
+## Target behavior
 
-The notes in `~/tmp/isaac_git_workflow` map Isaac's git lifecycle. The parts
-that matter for Omnigent are:
+The pooled lifecycle should provide:
 
 - Bootstrap creates numbered detached worktrees, for example
-  `universe-isaac-1`, using `git worktree add <path> databricks/master --detach`.
-- Each worker has exactly one worktree and all shell access is pinned to that
+  `omnigent-main-1`, using `git worktree add <path> <base> --detach`.
+- Each runner has exactly one leased worktree and all shell access is pinned to that
   root.
 - Task prep chooses a fast path when the worktree already matches the session,
   otherwise it checks out or creates the target branch from the requested base.
@@ -43,8 +43,8 @@ that matter for Omnigent are:
   files, removes stale index locks only after checking no git process is active,
   and can quarantine bad worktrees.
 
-For Omnigent, the important abstraction is not Isaac's Scala implementation. It
-is the lease lifecycle: prepare, lease, run, finalize, restore, release.
+The core abstraction is the lease lifecycle: prepare, lease, run, finalize,
+restore, release.
 
 ## Proposed Omnigent shape
 
@@ -165,10 +165,10 @@ There are two viable modes:
 - Session branch mode: acquire a clean slot, create or checkout
   `branch_name`, run the agent there, and leave commit or PR creation to the
   harness. This matches current Omnigent behavior most closely.
-- Isaac-like controlled commit mode: the host owns stage, commit, push, and
-  restore after the turn. This is better for fully autonomous coding workers
-  but is a larger product boundary because Omnigent native harnesses currently
-  let the vendor CLI run git directly.
+- Controlled commit mode: the host owns stage, commit, push, and restore after
+  the turn. This is better for fully autonomous coding workers but is a larger
+  product boundary because Omnigent native harnesses currently let the vendor
+  CLI run git directly.
 
 Start with session branch mode during the active runner lifetime. It keeps
 Omnigent compatible with existing native harnesses and uses the pool for
