@@ -42,6 +42,7 @@ from omnigent.host.frames import (
 from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
+    RUNNER_GIT_BRANCH_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -1320,6 +1321,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         runner_id="runner_abc",
         binding_token="tok",
         workspace="/ws",
+        git_branch="feature/pooled",
         parent_pid=42,
     )
 
@@ -1376,6 +1378,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env[RUNNER_ID_ENV_VAR] == "runner_abc"
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "tok"
     assert env[RUNNER_WORKSPACE_ENV_VAR] == "/ws"
+    assert env[RUNNER_GIT_BRANCH_ENV_VAR] == "feature/pooled"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
 
 

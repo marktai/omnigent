@@ -7841,6 +7841,7 @@ def create_runner_app(
     terminal_registry: Any | None = None,
     resource_registry: SessionResourceRegistry | None = None,
     runner_workspace: Path | None = None,
+    runner_git_branch: str | None = None,
     per_session_workspace: bool = True,
     mcp_manager: Any | None = None,
     auth_token: str | None = None,
@@ -7864,6 +7865,8 @@ def create_runner_app(
     :param runner_workspace: Optional local workspace path passed
         by the CLI when the runner owns filesystem tools for a
         remote app server session.
+    :param runner_git_branch: Optional branch checked out in
+        ``runner_workspace``.
     :param per_session_workspace: ``True`` (default) isolates each
         session under a subdirectory of *runner_workspace*.
         Single-user CLI runners pass ``False`` so the agent sees the
@@ -7880,6 +7883,7 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+    app.state.runner_git_branch = runner_git_branch
 
     # Instrument the runner ASGI app so HTTP requests tunneled in from
     # the server (whose headers are forwarded verbatim) continue the

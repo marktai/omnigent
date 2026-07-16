@@ -709,6 +709,7 @@ def create_hosts_router(
                 request_id=request_id,
                 binding_token=binding_token,
                 workspace=workspace,
+                git_branch=git_branch,
                 session_id=body.session_id,
                 harness=harness,
             )

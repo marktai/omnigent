@@ -112,6 +112,8 @@ class HostLaunchRunnerFrame:
     :param workspace: Absolute path on the host machine to use
         as the runner's working directory, e.g.
         ``"/Users/corey/projects/frontend"``.
+    :param git_branch: Git branch checked out in ``workspace`` when
+        Omnigent prepared a git worktree. ``None`` means no branch affinity.
     :param session_id: Conversation/session ID the runner is being
         launched for, e.g. ``"conv_abc123"``. ``None`` means an older
         server did not include it.
@@ -126,6 +128,7 @@ class HostLaunchRunnerFrame:
     request_id: str
     binding_token: str
     workspace: str
+    git_branch: str | None = None
     session_id: str | None = None
     harness: str | None = None
 
@@ -781,6 +784,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "binding_token": frame.binding_token,
                 "workspace": frame.workspace,
+                "git_branch": frame.git_branch,
                 "session_id": frame.session_id,
                 "harness": frame.harness,
             }
@@ -1203,6 +1207,7 @@ def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
         request_id=_required_str(msg, "request_id"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
+        git_branch=_optional_nullable_str(msg, "git_branch"),
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
     )

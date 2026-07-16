@@ -81,6 +81,7 @@ from omnigent.process_logging import (
 )
 from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
+    RUNNER_GIT_BRANCH_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -515,6 +516,7 @@ def _build_runner_env(
     binding_token: str,
     workspace: str,
     parent_pid: int,
+    git_branch: str | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -538,6 +540,7 @@ def _build_runner_env(
     :param workspace: Absolute runner cwd on the host, e.g.
         ``"/Users/alice/proj"``.
     :param parent_pid: Host process pid, for orphan detection.
+    :param git_branch: Branch checked out in ``workspace``, when known.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -557,6 +560,8 @@ def _build_runner_env(
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
+    if git_branch is not None:
+        env[RUNNER_GIT_BRANCH_ENV_VAR] = git_branch
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
     return env
 
@@ -1086,6 +1091,7 @@ class HostProcess:
             runner_id=runner_id,
             binding_token=frame.binding_token,
             workspace=str(workspace),
+            git_branch=frame.git_branch,
             parent_pid=os.getpid(),
         )
 

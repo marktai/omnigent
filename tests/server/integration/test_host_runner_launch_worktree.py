@@ -384,6 +384,8 @@ async def test_launch_runner_with_git_creates_worktree_and_persists_branch(
     assert cap.create[0].repo_path == _SOURCE_REPO
     assert cap.create[0].branch_name == "feature/login"
     assert cap.create[0].base_branch == "main"
+    assert len(cap.launch) == 1
+    assert cap.launch[0].git_branch == "feature/login"
     # Success path: no rollback.
     assert cap.remove == [], "worktree was rolled back on a successful launch"
 
@@ -430,6 +432,7 @@ async def test_launch_runner_with_git_pool_leases_slot_and_persists_labels(
     assert acquire.runner_id is not None
     assert len(cap.launch) == 1
     assert cap.launch[0].workspace == f"{_SOURCE_REPO}-omnigent-pool/slot-1"
+    assert cap.launch[0].git_branch == "feature/pooled"
     assert cap.release_pool == []
 
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
@@ -706,6 +709,8 @@ async def test_launch_runner_with_existing_worktree_persists_without_creating(
     assert resp.status_code == 200, resp.text
 
     assert cap.create == [], "no worktree should be created for an existing worktree"
+    assert len(cap.launch) == 1
+    assert cap.launch[0].git_branch == "feature/existing"
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.workspace == _SOURCE_REPO
@@ -792,6 +797,8 @@ async def test_launch_runner_retry_succeeds_after_failed_launch(
     assert second.status_code == 200, second.text
     assert second.json()["runner_id"]
     assert len(cap_ok.create) == 1, "retry created a fresh worktree off the source repo"
+    assert len(cap_ok.launch) == 1
+    assert cap_ok.launch[0].git_branch == "feature/y"
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.workspace == f"{_SOURCE_REPO}-worktrees/feature-y"
