@@ -196,6 +196,12 @@ class HostConnection:
         Resolved when the host sends ``host.fs_result``. Values
         carry ``status``, ``payload``, ``error_status``,
         ``error_code``, and ``error``.
+    :param pending_configure_worktree_pools: Per-``request_id``
+        futures for in-flight ``host.configure_worktree_pool`` requests.
+    :param pending_acquire_worktrees: Per-``request_id`` futures for
+        in-flight ``host.acquire_worktree`` requests.
+    :param pending_release_worktrees: Per-``request_id`` futures for
+        in-flight ``host.release_worktree`` requests.
     """
 
     host_id: str
@@ -233,6 +239,15 @@ class HostConnection:
         default_factory=dict,
     )
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_configure_worktree_pools: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_acquire_worktrees: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_release_worktrees: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
 

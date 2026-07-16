@@ -28,10 +28,13 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.host.frames import (
+    HostAcquireWorktreeFrame,
+    HostConfigureWorktreePoolFrame,
     HostCreateWorktreeFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostRemoveWorktreeFrame,
+    HostReleaseWorktreeFrame,
     HostStatFrame,
     decode_host_frame,
 )
@@ -108,6 +111,9 @@ class _HostCapture:
     create: list[HostCreateWorktreeFrame] = field(default_factory=list)
     launch: list[HostLaunchRunnerFrame] = field(default_factory=list)
     remove: list[HostRemoveWorktreeFrame] = field(default_factory=list)
+    configure_pool: list[HostConfigureWorktreePoolFrame] = field(default_factory=list)
+    acquire_pool: list[HostAcquireWorktreeFrame] = field(default_factory=list)
+    release_pool: list[HostReleaseWorktreeFrame] = field(default_factory=list)
 
 
 # register(*, create_status=, create_error=, launch_status=) -> _HostCapture
@@ -141,6 +147,10 @@ async def register_host(
         *,
         create_status: str = "ok",
         create_error: str | None = None,
+        acquire_status: str = "ok",
+        acquire_error: str | None = None,
+        release_status: str = "ok",
+        release_error: str | None = None,
         launch_status: str = "launched",
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
@@ -212,6 +222,58 @@ async def register_host(
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result({"status": "ok", "error": None})
+                elif isinstance(frame, HostConfigureWorktreePoolFrame):
+                    cap.configure_pool.append(frame)
+                    fut = conn.pending_configure_worktree_pools.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(
+                            {
+                                "status": "ok",
+                                "pool_id": frame.pool_id or "default-pool",
+                                "target_size": frame.target_size,
+                                "total_slots": frame.target_size,
+                                "idle_slots": frame.target_size,
+                                "error": None,
+                            }
+                        )
+                elif isinstance(frame, HostAcquireWorktreeFrame):
+                    cap.acquire_pool.append(frame)
+                    fut = conn.pending_acquire_worktrees.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        if acquire_status == "ok":
+                            fut.set_result(
+                                {
+                                    "status": "ok",
+                                    "lease_id": "lease_test_1",
+                                    "pool_id": frame.pool_id or "default-pool",
+                                    "slot_id": "slot-1",
+                                    "worktree_path": f"{frame.repo_path}-omnigent-pool/slot-1",
+                                    "branch": frame.branch_name,
+                                    "error": None,
+                                }
+                            )
+                        else:
+                            fut.set_result(
+                                {
+                                    "status": "failed",
+                                    "lease_id": None,
+                                    "pool_id": None,
+                                    "slot_id": None,
+                                    "worktree_path": None,
+                                    "branch": None,
+                                    "error": acquire_error,
+                                }
+                            )
+                elif isinstance(frame, HostReleaseWorktreeFrame):
+                    cap.release_pool.append(frame)
+                    fut = conn.pending_release_worktrees.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(
+                            {
+                                "status": release_status,
+                                "error": None if release_status == "ok" else release_error,
+                            }
+                        )
 
         conn._drain_task_for_test = asyncio.create_task(_drain())  # type: ignore[attr-defined]
         conns.append(conn)
@@ -262,6 +324,37 @@ async def _launch(
     return await client.post(f"/v1/hosts/{_HOST_ID}/runners", json=body)
 
 
+async def test_configure_worktree_pool_precreates_fixed_slot_count(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """The host pool endpoint sends a configure frame and returns slot status."""
+    cap = register_host()
+
+    resp = await client.post(
+        f"/v1/hosts/{_HOST_ID}/worktree-pools",
+        json={
+            "repo_path": _SOURCE_REPO,
+            "base_branch": "main",
+            "pool": {"target_size": 3, "pool_id": "universe-main"},
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "object": "worktree_pool",
+        "pool_id": "universe-main",
+        "target_size": 3,
+        "total_slots": 3,
+        "idle_slots": 3,
+    }
+    assert len(cap.configure_pool) == 1
+    assert cap.configure_pool[0].repo_path == _SOURCE_REPO
+    assert cap.configure_pool[0].base_branch == "main"
+    assert cap.configure_pool[0].target_size == 3
+    assert cap.configure_pool[0].pool_id == "universe-main"
+
+
 async def test_launch_runner_with_git_creates_worktree_and_persists_branch(
     register_host: RegisterHost,
     client: httpx.AsyncClient,
@@ -302,6 +395,266 @@ async def test_launch_runner_with_git_creates_worktree_and_persists_branch(
     assert conv.workspace == f"{_SOURCE_REPO}-worktrees/feature-login"
     assert conv.git_branch == "feature/login"
     assert conv.host_id == _HOST_ID
+
+
+async def test_launch_runner_with_git_pool_leases_slot_and_persists_labels(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``git.pool`` leases a fixed-pool slot instead of creating a new worktree."""
+    cap = register_host()
+    session_id = await _bare_session(client, "pooled-wt-launch-agent")
+
+    resp = await _launch(
+        client,
+        session_id,
+        git={
+            "branch_name": "feature/pooled",
+            "base_branch": "main",
+            "pool": {"target_size": 2, "pool_id": "universe-main"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["runner_id"]
+
+    assert cap.create == [], "pooled launch should not create an unbounded worktree"
+    assert len(cap.acquire_pool) == 1
+    acquire = cap.acquire_pool[0]
+    assert acquire.repo_path == _SOURCE_REPO
+    assert acquire.base_branch == "main"
+    assert acquire.target_size == 2
+    assert acquire.pool_id == "universe-main"
+    assert acquire.branch_name == "feature/pooled"
+    assert acquire.session_id == session_id
+    assert acquire.runner_id is not None
+    assert len(cap.launch) == 1
+    assert cap.launch[0].workspace == f"{_SOURCE_REPO}-omnigent-pool/slot-1"
+    assert cap.release_pool == []
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == f"{_SOURCE_REPO}-omnigent-pool/slot-1"
+    assert conv.git_branch == "feature/pooled"
+    assert conv.host_id == _HOST_ID
+    assert conv.labels["omnigent.worktree_pool.lease_id"] == "lease_test_1"
+    assert conv.labels["omnigent.worktree_pool.id"] == "universe-main"
+    assert conv.labels["omnigent.worktree_pool.slot_id"] == "slot-1"
+
+
+async def test_pooled_runner_disconnect_before_idle_timeout_keeps_lease(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    app: FastAPI,
+) -> None:
+    """A fresh disconnect keeps the pooled binding resumable."""
+    cap = register_host()
+    session_id = await _bare_session(client, "pooled-wt-fresh-disconnect-agent")
+
+    resp = await _launch(
+        client,
+        session_id,
+        git={
+            "branch_name": "feature/pooled",
+            "base_branch": "main",
+            "pool": {"target_size": 2, "pool_id": "universe-main"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is not None
+    await app.state._on_runner_disconnect_for_test(conv.runner_id)
+    await asyncio.sleep(0.05)
+
+    assert cap.release_pool == []
+    persisted = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert persisted is not None
+    assert persisted.runner_id == conv.runner_id
+    assert persisted.host_id == _HOST_ID
+    assert persisted.workspace == f"{_SOURCE_REPO}-omnigent-pool/slot-1"
+    eviction_task = app.state._pool_idle_eviction_tasks_for_test.pop(session_id, None)
+    if eviction_task is not None:
+        eviction_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await eviction_task
+
+
+async def test_pooled_runner_disconnect_after_idle_timeout_evicts_lease(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale disconnected pooled session releases its fixed-pool slot."""
+    import omnigent.server.app as server_app
+
+    cap = register_host()
+    session_id = await _bare_session(client, "pooled-wt-stale-disconnect-agent")
+
+    resp = await _launch(
+        client,
+        session_id,
+        git={
+            "branch_name": "feature/pooled",
+            "base_branch": "main",
+            "pool": {"target_size": 2, "pool_id": "universe-main"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is not None
+    monkeypatch.setattr(
+        server_app,
+        "now_epoch",
+        lambda: conv.updated_at + server_app._worktree_pool_idle_eviction_s() + 1,
+    )
+
+    await app.state._on_runner_disconnect_for_test(conv.runner_id)
+    for _ in range(100):
+        if cap.release_pool:
+            break
+        await asyncio.sleep(0.01)
+
+    assert len(cap.release_pool) == 1
+    assert cap.release_pool[0].lease_id == "lease_test_1"
+    assert cap.release_pool[0].delete_branch is True
+    persisted = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert persisted is not None
+    assert persisted.runner_id is None
+    assert persisted.host_id is None
+    assert persisted.workspace is None
+    assert persisted.git_branch is None
+    assert "omnigent.worktree_pool.lease_id" not in persisted.labels
+    assert "omnigent.worktree_pool.id" not in persisted.labels
+    assert "omnigent.worktree_pool.slot_id" not in persisted.labels
+
+
+async def test_pooled_runner_idle_release_failure_keeps_binding(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed finalize/release preserves the session's branch binding."""
+    import omnigent.server.app as server_app
+
+    cap = register_host(
+        release_status="failed",
+        release_error="git push failed",
+    )
+    session_id = await _bare_session(client, "pooled-wt-release-failure-agent")
+
+    resp = await _launch(
+        client,
+        session_id,
+        git={
+            "branch_name": "feature/pooled",
+            "base_branch": "main",
+            "pool": {"target_size": 2, "pool_id": "universe-main"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is not None
+    monkeypatch.setattr(
+        server_app,
+        "now_epoch",
+        lambda: conv.updated_at + server_app._worktree_pool_idle_eviction_s() + 1,
+    )
+
+    await app.state._on_runner_disconnect_for_test(conv.runner_id)
+    for _ in range(100):
+        if cap.release_pool:
+            break
+        await asyncio.sleep(0.01)
+
+    assert len(cap.release_pool) == 1
+    persisted = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert persisted is not None
+    assert persisted.runner_id == conv.runner_id
+    assert persisted.host_id == _HOST_ID
+    assert persisted.workspace == f"{_SOURCE_REPO}-omnigent-pool/slot-1"
+    assert persisted.git_branch == "feature/pooled"
+    assert persisted.labels["omnigent.worktree_pool.lease_id"] == "lease_test_1"
+
+
+async def test_launch_runner_with_git_pool_releases_lease_on_launch_failure(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A failed pooled launch releases the slot and fully unbinds the session."""
+    cap = register_host(launch_status="failed")
+    session_id = await _bare_session(client, "pooled-wt-rollback-agent")
+
+    resp = await _launch(
+        client,
+        session_id,
+        git={
+            "branch_name": "feature/pooled",
+            "base_branch": "main",
+            "pool": {"target_size": 2},
+        },
+    )
+
+    assert resp.status_code == 502, resp.text
+    assert len(cap.acquire_pool) == 1
+    assert len(cap.release_pool) == 1
+    assert cap.release_pool[0].lease_id == "lease_test_1"
+    assert cap.release_pool[0].delete_branch is True
+    assert cap.remove == [], "pooled rollback should release the lease, not remove a worktree"
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is None
+    assert conv.host_id is None
+    assert conv.workspace is None
+    assert conv.git_branch is None
+
+
+async def test_launch_runner_with_git_pool_capacity_error_returns_409(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Pool capacity errors are conflicts and do not bind or launch a runner."""
+    cap = register_host(
+        acquire_status="failed",
+        acquire_error="worktree pool 'universe-main' has no available slots",
+    )
+    session_id = await _bare_session(client, "pooled-wt-capacity-agent")
+
+    resp = await _launch(
+        client,
+        session_id,
+        git={
+            "branch_name": "feature/pooled",
+            "base_branch": "main",
+            "pool": {"target_size": 1, "pool_id": "universe-main"},
+        },
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "no available slots" in resp.text
+    assert len(cap.acquire_pool) == 1
+    assert cap.launch == []
+    assert cap.release_pool == []
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is None
+    assert conv.host_id is None
+    assert conv.workspace is None
+    assert conv.git_branch is None
 
 
 async def test_launch_runner_without_git_binds_source_dir_no_worktree(

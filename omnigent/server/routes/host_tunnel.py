@@ -27,6 +27,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
+    HostAcquireWorktreeResultFrame,
+    HostConfigureWorktreePoolResultFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostFsResultFrame,
@@ -35,6 +37,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostRemoveWorktreeResultFrame,
+    HostReleaseWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
     HostStatResultFrame,
@@ -557,6 +560,50 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "worktrees": frame.worktrees,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostConfigureWorktreePoolResultFrame):
+            configure_future = conn.pending_configure_worktree_pools.pop(
+                frame.request_id, None
+            )
+            if configure_future is not None and not configure_future.done():
+                configure_future.set_result(
+                    {
+                        "status": frame.status,
+                        "pool_id": frame.pool_id,
+                        "target_size": frame.target_size,
+                        "total_slots": frame.total_slots,
+                        "idle_slots": frame.idle_slots,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostAcquireWorktreeResultFrame):
+            acquire_future = conn.pending_acquire_worktrees.pop(frame.request_id, None)
+            if acquire_future is not None and not acquire_future.done():
+                acquire_future.set_result(
+                    {
+                        "status": frame.status,
+                        "lease_id": frame.lease_id,
+                        "pool_id": frame.pool_id,
+                        "slot_id": frame.slot_id,
+                        "worktree_path": frame.worktree_path,
+                        "branch": frame.branch,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostReleaseWorktreeResultFrame):
+            release_future = conn.pending_release_worktrees.pop(frame.request_id, None)
+            if release_future is not None and not release_future.done():
+                release_future.set_result(
+                    {
+                        "status": frame.status,
                         "error": frame.error,
                     }
                 )

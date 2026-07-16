@@ -1142,6 +1142,13 @@ class SessionEventInput(BaseModel):
     tools: list[dict[str, Any]] | None = None
 
 
+class SessionWorktreePoolOptions(BaseModel):
+    """Fixed-size worktree pool options for host-launched sessions."""
+
+    target_size: int = Field(ge=1)
+    pool_id: str | None = None
+
+
 class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
@@ -1170,25 +1177,33 @@ class SessionGitOptions(BaseModel):
         invalid with ``existing_worktree``.
     :param existing_worktree: When ``True``, bind to the pre-existing
         worktree at ``workspace`` instead of creating one (see above).
+    :param pool: When set in create mode, acquire a slot from a fixed-size
+        host worktree pool instead of creating a one-off worktree.
     """
 
     branch_name: str
     base_branch: str | None = None
     existing_worktree: bool = False
+    pool: SessionWorktreePoolOptions | None = None
 
     @model_validator(mode="after")
     def _check_existing_worktree(self) -> SessionGitOptions:
-        """Reject ``base_branch`` in bind mode (422).
+        """Reject invalid git option combinations (422).
 
         ``base_branch`` selects the ref a *new* branch forks from; it is
         meaningless when binding to a worktree that already exists.
+        Pool mode requires ``base_branch`` so the launch request matches
+        the explicitly precreated pool configuration.
 
         :returns: The validated instance.
-        :raises ValueError: If ``base_branch`` is set with
-            ``existing_worktree``.
+        :raises ValueError: If the option combination is invalid.
         """
         if self.existing_worktree and self.base_branch is not None:
             raise ValueError("base_branch cannot be set when existing_worktree is true")
+        if self.existing_worktree and self.pool is not None:
+            raise ValueError("pool cannot be set when existing_worktree is true")
+        if self.pool is not None and self.base_branch is None:
+            raise ValueError("base_branch must be set when pool is set")
         return self
 
 

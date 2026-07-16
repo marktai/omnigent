@@ -24,6 +24,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -92,6 +93,41 @@ from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
+
+_WORKTREE_POOL_IDLE_EVICTION_ENV = "OMNIGENT_WORKTREE_POOL_IDLE_EVICTION_S"
+_WORKTREE_POOL_LEASE_LABEL = "omnigent.worktree_pool.lease_id"
+_WORKTREE_POOL_ID_LABEL = "omnigent.worktree_pool.id"
+_WORKTREE_POOL_SLOT_LABEL = "omnigent.worktree_pool.slot_id"
+
+
+def _worktree_pool_idle_eviction_s() -> int:
+    """
+    Return the idle timeout before a disconnected pooled runner is evicted.
+
+    Defaults to one hour. Tests and local e2e runs can lower it with
+    ``OMNIGENT_WORKTREE_POOL_IDLE_EVICTION_S`` so they do not need to wait
+    for the production timeout.
+    """
+    raw = os.environ.get(_WORKTREE_POOL_IDLE_EVICTION_ENV)
+    if raw is None or raw.strip() == "":
+        return 60 * 60
+    try:
+        value = int(raw)
+    except ValueError:
+        _logger.warning(
+            "Invalid %s=%r; using default 3600",
+            _WORKTREE_POOL_IDLE_EVICTION_ENV,
+            raw,
+        )
+        return 60 * 60
+    if value < 0:
+        _logger.warning(
+            "Invalid %s=%r; using default 3600",
+            _WORKTREE_POOL_IDLE_EVICTION_ENV,
+            raw,
+        )
+        return 60 * 60
+    return value
 
 
 def _server_version() -> str:
@@ -2227,6 +2263,9 @@ def create_app(
         tags=["sharing"],
     )
 
+    pool_idle_eviction_tasks: dict[str, asyncio.Task[None]] = {}
+    pool_lease_releases_in_flight: set[str] = set()
+
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
     async def _on_runner_disconnect(runner_id: str) -> None:
         """Mark sessions pinned to *this* runner as offline.
@@ -2286,6 +2325,129 @@ def create_app(
         for session_id in affected:
             _session_status_cache[session_id] = "failed"
             _publish_status(session_id, "failed")
+            _schedule_idle_pool_eviction(session_id)
+
+    async def _release_pool_lease_and_clear_binding(
+        session_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """
+        Release a host-managed worktree-pool lease and unbind its session.
+
+        This runs as a background task from host/runner tunnel callbacks.
+        Waiting inline can deadlock a tunnel receive loop: the release helper
+        sends a frame to the host connection and waits for the result frame,
+        which cannot be received until the callback returns.
+        """
+        if session_id in pool_lease_releases_in_flight:
+            return
+        pool_lease_releases_in_flight.add(session_id)
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                return
+            lease_id = conv.labels.get(_WORKTREE_POOL_LEASE_LABEL)
+            if not lease_id or conv.host_id is None:
+                return
+            host_conn = host_registry.get(conv.host_id)
+            if host_conn is None:
+                _logger.warning(
+                    "Skipping pool worktree release for %s session %s: host %s offline",
+                    reason,
+                    session_id,
+                    conv.host_id,
+                )
+                return
+            from omnigent.server.routes._host_worktree_pool import (
+                WorktreePoolProxyError,
+                release_worktree_on_host,
+            )
+
+            try:
+                await release_worktree_on_host(
+                    host_registry=host_registry,
+                    host_conn=host_conn,
+                    lease_id=lease_id,
+                    delete_branch=True,
+                )
+            except WorktreePoolProxyError:
+                _logger.warning(
+                    "Best-effort pool worktree release failed after %s for %s",
+                    reason,
+                    session_id,
+                    exc_info=True,
+                )
+                return
+            await asyncio.to_thread(conversation_store.clear_host_binding, session_id)
+            # TODO: Hook post-release side effects here, after the host has
+            # confirmed finalize/restore/release. This is the right place for
+            # server-owned follow-ups such as persisting finalize metadata or
+            # notifying clients; host-local git side effects belong in the
+            # release frame handler before it returns success.
+            for label_key in (
+                _WORKTREE_POOL_LEASE_LABEL,
+                _WORKTREE_POOL_ID_LABEL,
+                _WORKTREE_POOL_SLOT_LABEL,
+            ):
+                await asyncio.to_thread(
+                    conversation_store.delete_label,
+                    session_id,
+                    label_key,
+                )
+        finally:
+            pool_lease_releases_in_flight.discard(session_id)
+
+    def _schedule_idle_pool_eviction(session_id: str) -> None:
+        existing = pool_idle_eviction_tasks.get(session_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            _evict_idle_pool_lease_after_runner_disconnect(session_id),
+            name=f"pool-idle-eviction:{session_id}",
+        )
+        pool_idle_eviction_tasks[session_id] = task
+
+        def _forget(done: asyncio.Task[None]) -> None:
+            if pool_idle_eviction_tasks.get(session_id) is done:
+                pool_idle_eviction_tasks.pop(session_id, None)
+
+        task.add_done_callback(_forget)
+
+    async def _evict_idle_pool_lease_after_runner_disconnect(session_id: str) -> None:
+        """
+        LRU-evict a pooled worktree only after the session has been idle.
+
+        A runner disconnect is often transient: the process can reconnect, or
+        the next user turn can relaunch it against the same host binding. Keep
+        that binding during the one-hour idle window. Once the session is old
+        enough and no runner tunnel is live, release the fixed-pool slot and
+        clear the binding so the pool stays at its configured target size.
+        """
+        while True:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                return
+            lease_id = conv.labels.get(_WORKTREE_POOL_LEASE_LABEL)
+            if not lease_id or conv.runner_id is None:
+                return
+            if tunnel_registry.get(conv.runner_id) is not None:
+                return
+            remaining = _worktree_pool_idle_eviction_s() - (now_epoch() - conv.updated_at)
+            if remaining <= 0:
+                await _release_pool_lease_and_clear_binding(
+                    session_id,
+                    reason="idle runner disconnect",
+                )
+                return
+            await asyncio.sleep(min(remaining, 60))
+
+    async def _release_pool_lease_after_runner_exit(session_id: str) -> None:
+        """Release a host-managed worktree-pool lease after a spawned runner dies."""
+        await _release_pool_lease_and_clear_binding(
+            session_id,
+            reason="runner exit",
+        )
 
     async def _on_runner_exited(runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
@@ -2324,6 +2486,7 @@ def create_app(
         for session_id in affected:
             _session_status_cache[session_id] = "failed"
             _publish_status(session_id, "failed", error=detail)
+            asyncio.create_task(_release_pool_lease_after_runner_exit(session_id))
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
@@ -2359,6 +2522,9 @@ def create_app(
             len(convs),
         )
         for conv in convs:
+            eviction_task = pool_idle_eviction_tasks.pop(conv.id, None)
+            if eviction_task is not None:
+                eviction_task.cancel()
             _logger.info(
                 "_on_runner_connect: matched %s (agent=%s)",
                 conv.id,
@@ -2437,6 +2603,9 @@ def create_app(
             if owner is not None:
                 return owner
         return None
+
+    app.state._on_runner_disconnect_for_test = _on_runner_disconnect
+    app.state._pool_idle_eviction_tasks_for_test = pool_idle_eviction_tasks
 
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
     app.include_router(

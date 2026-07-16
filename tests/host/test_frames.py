@@ -8,6 +8,10 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostAcquireWorktreeFrame,
+    HostAcquireWorktreeResultFrame,
+    HostConfigureWorktreePoolFrame,
+    HostConfigureWorktreePoolResultFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -24,6 +28,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
+    HostReleaseWorktreeFrame,
+    HostReleaseWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -946,6 +952,101 @@ def test_list_worktrees_result_frame_rejects_non_list() -> None:
     )
     with pytest.raises(ValueError, match="worktrees"):
         decode_host_frame(bad)
+
+
+# ── host worktree-pool frames ───────────────────────────
+
+
+def test_configure_worktree_pool_frame_round_trip() -> None:
+    """Verify the fixed-pool configure request survives encode → decode."""
+    original = HostConfigureWorktreePoolFrame(
+        request_id="req_pool_1",
+        repo_path="/Users/alice/myrepo",
+        base_branch="main",
+        target_size=4,
+        pool_id="universe-main",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostConfigureWorktreePoolFrame)
+    assert decoded == original
+
+
+def test_configure_worktree_pool_result_frame_round_trip() -> None:
+    """Verify pool status fields survive encode → decode."""
+    original = HostConfigureWorktreePoolResultFrame(
+        request_id="req_pool_1",
+        status="ok",
+        pool_id="universe-main",
+        target_size=4,
+        total_slots=4,
+        idle_slots=3,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostConfigureWorktreePoolResultFrame)
+    assert decoded == original
+
+
+def test_acquire_worktree_frame_round_trip() -> None:
+    """Verify the lease request carries pool, branch, session, and runner."""
+    original = HostAcquireWorktreeFrame(
+        request_id="req_acq_1",
+        repo_path="/Users/alice/myrepo",
+        base_branch="main",
+        target_size=4,
+        pool_id="universe-main",
+        branch_name="feature/login",
+        session_id="conv_1",
+        runner_id="runner_1",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostAcquireWorktreeFrame)
+    assert decoded == original
+
+
+def test_acquire_worktree_result_frame_round_trip() -> None:
+    """Verify an acquired slot returns lease identity and workspace path."""
+    original = HostAcquireWorktreeResultFrame(
+        request_id="req_acq_1",
+        status="ok",
+        lease_id="lease_1",
+        pool_id="universe-main",
+        slot_id="slot-1",
+        worktree_path="/Users/alice/myrepo-omnigent-pool/universe-main/slot-1",
+        branch="feature/login",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostAcquireWorktreeResultFrame)
+    assert decoded == original
+
+
+def test_release_worktree_frame_round_trip() -> None:
+    """Verify release carries the lease id and branch-delete intent."""
+    original = HostReleaseWorktreeFrame(
+        request_id="req_rel_1",
+        lease_id="lease_1",
+        delete_branch=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostReleaseWorktreeFrame)
+    assert decoded == original
+
+
+def test_release_worktree_frame_non_bool_delete_branch_raises() -> None:
+    """A non-bool pooled release delete flag is rejected, not coerced."""
+    bad = (
+        '{"kind": "host.release_worktree", "request_id": "r", '
+        '"lease_id": "lease_1", "delete_branch": "yes"}'
+    )
+    with pytest.raises(ValueError, match="delete_branch"):
+        decode_host_frame(bad)
+
+
+def test_release_worktree_result_frame_round_trip() -> None:
+    """Verify release result status survives encode → decode."""
+    original = HostReleaseWorktreeResultFrame(request_id="req_rel_1", status="ok")
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostReleaseWorktreeResultFrame)
+    assert decoded == original
 
 
 # ── host.create_dir frames ──────────────────────────────

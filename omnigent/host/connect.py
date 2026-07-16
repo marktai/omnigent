@@ -26,10 +26,14 @@ from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostAcquireWorktreeFrame,
+    HostAcquireWorktreeResultFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
+    HostConfigureWorktreePoolFrame,
+    HostConfigureWorktreePoolResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostHelloFrame,
@@ -42,6 +46,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
+    HostReleaseWorktreeFrame,
+    HostReleaseWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -58,6 +64,7 @@ from omnigent.host.git_worktree import (
     list_worktrees,
     remove_worktree,
 )
+from omnigent.host.worktree_pool import WorktreePoolError, WorktreePoolManager
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.onboarding.harness_install import harness_setup_hint
 from omnigent.onboarding.harness_readiness import (
@@ -667,6 +674,7 @@ class HostProcess:
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
+        self._worktree_pool = WorktreePoolManager()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
@@ -1758,6 +1766,88 @@ class HostProcess:
             ],
         )
 
+    async def _handle_configure_worktree_pool(
+        self,
+        frame: HostConfigureWorktreePoolFrame,
+    ) -> HostConfigureWorktreePoolResultFrame:
+        """Handle a ``host.configure_worktree_pool`` request."""
+        try:
+            with self._host_subprocess_op():
+                status = await asyncio.to_thread(
+                    self._worktree_pool.configure_pool,
+                    repo_path=frame.repo_path,
+                    base_branch=frame.base_branch,
+                    target_size=frame.target_size,
+                    pool_id=frame.pool_id,
+                )
+        except WorktreePoolError as exc:
+            return HostConfigureWorktreePoolResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=exc.message,
+            )
+        return HostConfigureWorktreePoolResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            pool_id=status.pool_id,
+            target_size=status.target_size,
+            total_slots=status.total_slots,
+            idle_slots=status.idle_slots,
+        )
+
+    async def _handle_acquire_worktree(
+        self,
+        frame: HostAcquireWorktreeFrame,
+    ) -> HostAcquireWorktreeResultFrame:
+        """Handle a ``host.acquire_worktree`` request."""
+        try:
+            with self._host_subprocess_op():
+                acquired = await asyncio.to_thread(
+                    self._worktree_pool.acquire,
+                    repo_path=frame.repo_path,
+                    base_branch=frame.base_branch,
+                    target_size=frame.target_size,
+                    branch_name=frame.branch_name,
+                    pool_id=frame.pool_id,
+                    session_id=frame.session_id,
+                    runner_id=frame.runner_id,
+                )
+        except (WorktreePoolError, WorktreeError) as exc:
+            return HostAcquireWorktreeResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=getattr(exc, "message", str(exc)),
+            )
+        return HostAcquireWorktreeResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            lease_id=acquired.lease_id,
+            pool_id=acquired.pool_id,
+            slot_id=acquired.slot_id,
+            worktree_path=acquired.worktree_path,
+            branch=acquired.branch,
+        )
+
+    async def _handle_release_worktree(
+        self,
+        frame: HostReleaseWorktreeFrame,
+    ) -> HostReleaseWorktreeResultFrame:
+        """Handle a ``host.release_worktree`` request."""
+        try:
+            with self._host_subprocess_op():
+                await asyncio.to_thread(
+                    self._worktree_pool.release,
+                    lease_id=frame.lease_id,
+                    delete_branch=frame.delete_branch,
+                )
+        except WorktreePoolError as exc:
+            return HostReleaseWorktreeResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=exc.message,
+            )
+        return HostReleaseWorktreeResultFrame(request_id=frame.request_id, status="ok")
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -2120,6 +2210,12 @@ class HostProcess:
             # off the event loop and reply when it completes.
             result = await asyncio.to_thread(self._handle_fs_request, frame)
             await ws.send(encode_host_frame(result))
+        elif isinstance(frame, HostConfigureWorktreePoolFrame):
+            await ws.send(encode_host_frame(await self._handle_configure_worktree_pool(frame)))
+        elif isinstance(frame, HostAcquireWorktreeFrame):
+            await ws.send(encode_host_frame(await self._handle_acquire_worktree(frame)))
+        elif isinstance(frame, HostReleaseWorktreeFrame):
+            await ws.send(encode_host_frame(await self._handle_release_worktree(frame)))
 
 
 def run_host_process(

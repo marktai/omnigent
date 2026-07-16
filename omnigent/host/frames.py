@@ -55,6 +55,12 @@ class HostFrameKind(str, Enum):
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
     LIST_WORKTREES = "host.list_worktrees"
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
+    CONFIGURE_WORKTREE_POOL = "host.configure_worktree_pool"
+    CONFIGURE_WORKTREE_POOL_RESULT = "host.configure_worktree_pool_result"
+    ACQUIRE_WORKTREE = "host.acquire_worktree"
+    ACQUIRE_WORKTREE_RESULT = "host.acquire_worktree_result"
+    RELEASE_WORKTREE = "host.release_worktree"
+    RELEASE_WORKTREE_RESULT = "host.release_worktree_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
     FS_REQUEST = "host.fs_request"
@@ -523,6 +529,76 @@ class HostListWorktreesResultFrame:
 
 
 @dataclass
+class HostConfigureWorktreePoolFrame:
+    """Server → host: configure a fixed-size worktree pool."""
+
+    request_id: str
+    repo_path: str
+    base_branch: str
+    target_size: int
+    pool_id: str | None = None
+
+
+@dataclass
+class HostConfigureWorktreePoolResultFrame:
+    """Host → server: result of configuring a worktree pool."""
+
+    request_id: str
+    status: str
+    pool_id: str | None = None
+    target_size: int | None = None
+    total_slots: int | None = None
+    idle_slots: int | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostAcquireWorktreeFrame:
+    """Server → host: lease one slot from a fixed-size worktree pool."""
+
+    request_id: str
+    repo_path: str
+    base_branch: str
+    target_size: int
+    pool_id: str | None = None
+    branch_name: str | None = None
+    session_id: str | None = None
+    runner_id: str | None = None
+
+
+@dataclass
+class HostAcquireWorktreeResultFrame:
+    """Host → server: result of acquiring a pool worktree."""
+
+    request_id: str
+    status: str
+    lease_id: str | None = None
+    pool_id: str | None = None
+    slot_id: str | None = None
+    worktree_path: str | None = None
+    branch: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostReleaseWorktreeFrame:
+    """Server → host: release a leased pool worktree."""
+
+    request_id: str
+    lease_id: str
+    delete_branch: bool = False
+
+
+@dataclass
+class HostReleaseWorktreeResultFrame:
+    """Host → server: result of releasing a pool worktree."""
+
+    request_id: str
+    status: str
+    error: str | None = None
+
+
+@dataclass
 class HostCreateDirFrame:
     """Server → host: create a new directory on the host.
 
@@ -638,6 +714,12 @@ HostFrame = (
     | HostRemoveWorktreeResultFrame
     | HostListWorktreesFrame
     | HostListWorktreesResultFrame
+    | HostConfigureWorktreePoolFrame
+    | HostConfigureWorktreePoolResultFrame
+    | HostAcquireWorktreeFrame
+    | HostAcquireWorktreeResultFrame
+    | HostReleaseWorktreeFrame
+    | HostReleaseWorktreeResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
     | HostFsRequestFrame
@@ -864,6 +946,76 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostConfigureWorktreePoolFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CONFIGURE_WORKTREE_POOL.value,
+                "request_id": frame.request_id,
+                "repo_path": frame.repo_path,
+                "base_branch": frame.base_branch,
+                "target_size": frame.target_size,
+                "pool_id": frame.pool_id,
+            }
+        )
+    if isinstance(frame, HostConfigureWorktreePoolResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CONFIGURE_WORKTREE_POOL_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "pool_id": frame.pool_id,
+                "target_size": frame.target_size,
+                "total_slots": frame.total_slots,
+                "idle_slots": frame.idle_slots,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostAcquireWorktreeFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.ACQUIRE_WORKTREE.value,
+                "request_id": frame.request_id,
+                "repo_path": frame.repo_path,
+                "base_branch": frame.base_branch,
+                "target_size": frame.target_size,
+                "pool_id": frame.pool_id,
+                "branch_name": frame.branch_name,
+                "session_id": frame.session_id,
+                "runner_id": frame.runner_id,
+            }
+        )
+    if isinstance(frame, HostAcquireWorktreeResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.ACQUIRE_WORKTREE_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "lease_id": frame.lease_id,
+                "pool_id": frame.pool_id,
+                "slot_id": frame.slot_id,
+                "worktree_path": frame.worktree_path,
+                "branch": frame.branch,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostReleaseWorktreeFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RELEASE_WORKTREE.value,
+                "request_id": frame.request_id,
+                "lease_id": frame.lease_id,
+                "delete_branch": frame.delete_branch,
+            }
+        )
+    if isinstance(frame, HostReleaseWorktreeResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RELEASE_WORKTREE_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostCreateDirFrame):
         return _encode_payload(
             {
@@ -1001,6 +1153,18 @@ def _decode_known_host_frame(
             return _decode_list_worktrees(msg)
         case HostFrameKind.LIST_WORKTREES_RESULT:
             return _decode_list_worktrees_result(msg)
+        case HostFrameKind.CONFIGURE_WORKTREE_POOL:
+            return _decode_configure_worktree_pool(msg)
+        case HostFrameKind.CONFIGURE_WORKTREE_POOL_RESULT:
+            return _decode_configure_worktree_pool_result(msg)
+        case HostFrameKind.ACQUIRE_WORKTREE:
+            return _decode_acquire_worktree(msg)
+        case HostFrameKind.ACQUIRE_WORKTREE_RESULT:
+            return _decode_acquire_worktree_result(msg)
+        case HostFrameKind.RELEASE_WORKTREE:
+            return _decode_release_worktree(msg)
+        case HostFrameKind.RELEASE_WORKTREE_RESULT:
+            return _decode_release_worktree_result(msg)
         case HostFrameKind.CREATE_DIR:
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
@@ -1319,6 +1483,81 @@ def _decode_list_worktrees_result(
     )
 
 
+def _decode_configure_worktree_pool(msg: dict[str, Any]) -> HostConfigureWorktreePoolFrame:
+    """Decode a host.configure_worktree_pool request frame."""
+    return HostConfigureWorktreePoolFrame(
+        request_id=_required_str(msg, "request_id"),
+        repo_path=_required_str(msg, "repo_path"),
+        base_branch=_required_str(msg, "base_branch"),
+        target_size=_required_int(msg, "target_size"),
+        pool_id=_optional_nullable_str(msg, "pool_id"),
+    )
+
+
+def _decode_configure_worktree_pool_result(
+    msg: dict[str, Any],
+) -> HostConfigureWorktreePoolResultFrame:
+    """Decode a host.configure_worktree_pool_result frame."""
+    return HostConfigureWorktreePoolResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        pool_id=_optional_nullable_str(msg, "pool_id"),
+        target_size=_optional_nullable_int(msg, "target_size"),
+        total_slots=_optional_nullable_int(msg, "total_slots"),
+        idle_slots=_optional_nullable_int(msg, "idle_slots"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_acquire_worktree(msg: dict[str, Any]) -> HostAcquireWorktreeFrame:
+    """Decode a host.acquire_worktree request frame."""
+    return HostAcquireWorktreeFrame(
+        request_id=_required_str(msg, "request_id"),
+        repo_path=_required_str(msg, "repo_path"),
+        base_branch=_required_str(msg, "base_branch"),
+        target_size=_required_int(msg, "target_size"),
+        pool_id=_optional_nullable_str(msg, "pool_id"),
+        branch_name=_optional_nullable_str(msg, "branch_name"),
+        session_id=_optional_nullable_str(msg, "session_id"),
+        runner_id=_optional_nullable_str(msg, "runner_id"),
+    )
+
+
+def _decode_acquire_worktree_result(msg: dict[str, Any]) -> HostAcquireWorktreeResultFrame:
+    """Decode a host.acquire_worktree_result frame."""
+    return HostAcquireWorktreeResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        lease_id=_optional_nullable_str(msg, "lease_id"),
+        pool_id=_optional_nullable_str(msg, "pool_id"),
+        slot_id=_optional_nullable_str(msg, "slot_id"),
+        worktree_path=_optional_nullable_str(msg, "worktree_path"),
+        branch=_optional_nullable_str(msg, "branch"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_release_worktree(msg: dict[str, Any]) -> HostReleaseWorktreeFrame:
+    """Decode a host.release_worktree request frame."""
+    delete_branch = msg.get("delete_branch", False)
+    if not isinstance(delete_branch, bool):
+        raise ValueError("frame field must be a bool: 'delete_branch'")
+    return HostReleaseWorktreeFrame(
+        request_id=_required_str(msg, "request_id"),
+        lease_id=_required_str(msg, "lease_id"),
+        delete_branch=delete_branch,
+    )
+
+
+def _decode_release_worktree_result(msg: dict[str, Any]) -> HostReleaseWorktreeResultFrame:
+    """Decode a host.release_worktree_result frame."""
+    return HostReleaseWorktreeResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
 def _decode_create_dir(msg: dict[str, Any]) -> HostCreateDirFrame:
     """Decode a host.create_dir request frame.
 
@@ -1481,4 +1720,14 @@ def _optional_nullable_str(msg: dict[str, Any], key: str) -> str | None:
         return None
     if not isinstance(val, str):
         raise ValueError(f"frame field must be a string or null: {key!r}")
+    return val
+
+
+def _optional_nullable_int(msg: dict[str, Any], key: str) -> int | None:
+    """Return an optional nullable integer field."""
+    val = msg.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, int) or isinstance(val, bool):
+        raise ValueError(f"frame field must be an int or null: {key!r}")
     return val

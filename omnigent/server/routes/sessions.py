@@ -612,6 +612,7 @@ _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
 # terminal-ensure 200 response.
 _NATIVE_POLICY_NOT_ENFORCED_CODE = "native_policy_not_enforced"
 _HOST_BOUND_RUNNER_CONNECT_GRACE_S = 10.0
+_WORKTREE_POOL_LEASE_LABEL = "omnigent.worktree_pool.lease_id"
 _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
 # Wait budget for the host's ``host.runner_status`` reply. The host answers
 # from an in-memory dict (a ``Popen.poll()``), so the round-trip is just the
@@ -21110,10 +21111,39 @@ def create_sessions_router(
             )
             for fid in deleted_file_ids:
                 await asyncio.to_thread(artifact_store.delete, fid)
+        pool_lease_id = conv.labels.get(_WORKTREE_POOL_LEASE_LABEL)
+        if pool_lease_id and conv.host_id is not None:
+            from omnigent.server.routes._host_worktree_pool import (
+                WorktreePoolProxyError,
+                release_worktree_on_host,
+            )
+
+            host_registry = getattr(request.app.state, "host_registry", None)
+            host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+            if host_conn is not None:
+                try:
+                    await release_worktree_on_host(
+                        host_registry=host_registry,
+                        host_conn=host_conn,
+                        lease_id=pool_lease_id,
+                        delete_branch=delete_branch,
+                    )
+                except WorktreePoolProxyError:
+                    _logger.warning(
+                        "Best-effort pool worktree release failed for %s",
+                        session_id,
+                        exc_info=True,
+                    )
+            else:
+                _logger.warning(
+                    "Skipping pool worktree release for %s: host %s offline",
+                    session_id,
+                    conv.host_id,
+                )
         # Opt-in git worktree cleanup: only when delete_branch=true and
-        # the session has a server-created worktree. Runs after runner
+        # the session has a server-created one-off worktree. Runs after runner
         # teardown; best-effort (designs/SESSION_GIT_WORKTREE.md).
-        if (
+        elif (
             delete_branch
             and conv.git_branch is not None
             and conv.workspace is not None
