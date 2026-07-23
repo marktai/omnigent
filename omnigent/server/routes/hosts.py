@@ -340,8 +340,9 @@ class LaunchRunnerRequest(BaseModel):
     """
 
     session_id: str
-    workspace: str
+    workspace: str = ""
     git: SessionGitOptions | None = None
+    managed_repo: str | None = None
 
 
 async def _resolve_agent_spec_cwd(
@@ -594,6 +595,9 @@ def create_hosts_router(
         )
         conn = target.conn
 
+        binding_token = secrets.token_urlsafe(32)
+        runner_id = token_bound_runner_id(binding_token)
+
         # W6: validate the requested workspace against the agent's
         # os_env.cwd sandbox boundary BEFORE binding — the same check
         # POST /v1/sessions enforces. Without it, an owner could bind a
@@ -603,7 +607,16 @@ def create_hosts_router(
         # when the router was wired without an agent cache (non-prod
         # test wiring); create_app always supplies one.
         workspace = body.workspace
-        if agent_store is not None and agent_cache is not None:
+        if body.managed_repo is not None:
+            if not body.managed_repo.strip():
+                raise HTTPException(status_code=400, detail="managed_repo must not be empty")
+            if body.git is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="managed_repo launch requires git branch options",
+                )
+            workspace = f"managed://{body.managed_repo}"
+        elif agent_store is not None and agent_cache is not None:
             from omnigent.server.routes._workspace_validation import (
                 WorkspaceValidationError,
                 validate_workspace,
@@ -634,11 +647,13 @@ def create_hosts_router(
         # lost CAS or a failed launch can roll it back, leaving no orphan
         # worktree on the host.
         git_branch: str | None = None
+        if body.managed_repo is not None and body.git is not None:
+            git_branch = body.git.branch_name
         # CreatedWorktree | None — set ONLY when Omnigent creates a worktree
         # (create mode). Left None in bind mode so the rollback below never
         # force-removes the user's pre-existing worktree.
         worktree = None
-        if body.git is not None:
+        if body.git is not None and body.managed_repo is None:
             from omnigent.host.git_worktree import (
                 WorktreeError,
                 validate_branch_name,
@@ -672,11 +687,8 @@ def create_hosts_router(
                         base_branch=body.git.base_branch,
                     )
                 except WorktreeHostUnavailableError as exc:
-                    # Host offline / unresponsive — infra, not user input.
                     raise HTTPException(status_code=409, detail=exc.message) from exc
                 except WorktreeProxyError as exc:
-                    # Host-reported git failure (dup branch, bad base, not a
-                    # repo) — user-correctable input.
                     raise HTTPException(status_code=400, detail=exc.message) from exc
                 workspace = worktree.worktree_path
                 git_branch = worktree.branch
@@ -735,9 +747,6 @@ def create_hosts_router(
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             await _rollback_worktree()
 
-        binding_token = secrets.token_urlsafe(32)
-        runner_id = token_bound_runner_id(binding_token)
-
         # Atomic bind (UPDATE ... WHERE runner_id IS NULL): only one
         # concurrent launch can bind an unbound session; a second (or an
         # already-bound session) gets False. Closes the TOCTOU.
@@ -782,6 +791,8 @@ def create_hosts_router(
                 request_id=request_id,
                 binding_token=binding_token,
                 workspace=workspace,
+                git_branch=git_branch,
+                managed_repo=body.managed_repo,
                 session_id=body.session_id,
                 harness=harness,
             )
@@ -811,6 +822,11 @@ def create_hosts_router(
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()
+            if result.get("error_code") == "managed_worktree_capacity":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"host failed to launch runner: {result.get('error')}",
+                )
             if result.get("error_code") == HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # Categorical refusal: the harness isn't configured on
                 # the host, so a retry can't succeed without user action
@@ -823,6 +839,17 @@ def create_hosts_router(
             raise HTTPException(
                 status_code=502,
                 detail=f"host failed to launch runner: {result.get('error')}",
+            )
+
+        resolved_workspace = result.get("workspace")
+        resolved_git_branch = result.get("git_branch")
+        if body.managed_repo is not None and isinstance(resolved_workspace, str):
+            await asyncio.to_thread(
+                conversation_store.set_host_id,
+                body.session_id,
+                host_id,
+                resolved_workspace,
+                resolved_git_branch if isinstance(resolved_git_branch, str) else git_branch,
             )
 
         return {
