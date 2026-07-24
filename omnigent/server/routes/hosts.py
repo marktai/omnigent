@@ -23,7 +23,7 @@ import secrets
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
@@ -328,7 +328,8 @@ class LaunchRunnerRequest(BaseModel):
         as the runner's working directory, e.g.
         ``"/Users/corey/projects/frontend"``. When ``git`` is set,
         this is interpreted as the source repository directory and
-        the runner starts in the created worktree instead.
+        the runner starts in the created worktree instead. Required
+        unless ``managed_repo`` selects a host-managed pool.
     :param git: Optional git worktree options. In create mode the
         server creates a worktree for a new branch off ``workspace`` on
         the host and binds the runner to it (the fork-resume path;
@@ -338,12 +339,31 @@ class LaunchRunnerRequest(BaseModel):
         as the session's ``git_branch`` for display and opt-in cleanup.
         ``None`` binds ``workspace`` directly. ``host_id`` is always
         present (it is in the path), so no host check is needed here.
+    :param managed_repo: Optional host-local managed repository alias.
+        When set, the host selects the physical worktree and
+        ``workspace`` may be omitted.
     """
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "anyOf": [
+                {"required": ["workspace"]},
+                {"required": ["managed_repo"]},
+            ]
+        }
+    )
+
     session_id: str
-    workspace: str = ""
+    workspace: str = Field(default="", min_length=1)
     git: SessionGitOptions | None = None
     managed_repo: str | None = None
+
+    @model_validator(mode="after")
+    def _require_execution_target(self) -> LaunchRunnerRequest:
+        """Require a physical workspace or a host-managed repository."""
+        if not self.workspace.strip() and self.managed_repo is None:
+            raise ValueError("workspace is required unless managed_repo is provided")
+        return self
 
 
 async def _resolve_agent_spec_cwd(
