@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import time
@@ -20,15 +21,18 @@ from tests._helpers.compat import (
     server_executable,
 )
 from tests.e2e.conftest import (
+    configure_mock_llm,
     find_free_port,
+    get_mock_requests,
     lookup_agent_id,
+    poll_session_until_terminal,
+    send_user_message_to_session,
     upload_agent,
     wait_for_server,
 )
-from tests.e2e.helpers import POLL_INTERVAL_S
+from tests.e2e.helpers import POLL_INTERVAL_S, final_assistant_text
 from tests.e2e.test_host_e2e import (
     _pid_alive,
-    _runner_pid_from_daemon_log,
     _spawn_host_daemon,
     _wait_for_host_online,
 )
@@ -196,6 +200,69 @@ def _wait_for_runner_online(client: httpx.Client, runner_id: str, timeout: float
     raise AssertionError(f"runner {runner_id!r} did not come online")
 
 
+def _wait_for_runner_offline(client: httpx.Client, runner_id: str, timeout: float = 15.0) -> None:
+    """Poll until a killed runner tunnel is no longer reachable."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/runners/{runner_id}/status", timeout=5.0)
+        if resp.status_code != 200 or resp.json().get("online") is not True:
+            return
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"runner {runner_id!r} remained online")
+
+
+def _wait_for_new_runner(
+    client: httpx.Client,
+    session_id: str,
+    previous_runner_id: str | None,
+    timeout: float = 30.0,
+) -> str:
+    """Poll until a resume rotates the session to a connected runner."""
+    deadline = time.monotonic() + timeout
+    last: dict | None = None
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/sessions/{session_id}", timeout=5.0)
+        resp.raise_for_status()
+        last = resp.json()
+        runner_id = last.get("runner_id")
+        if isinstance(runner_id, str) and runner_id != previous_runner_id:
+            status = client.get(f"/v1/runners/{runner_id}/status", timeout=5.0)
+            if status.status_code == 200 and status.json().get("online") is True:
+                return runner_id
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"session {session_id!r} did not bind a new runner; last={last}")
+
+
+def _latest_runner_pid(log_path: Path) -> int:
+    """Return the most recently logged host-spawned runner PID."""
+    matches = re.findall(
+        r"Launched runner \S+ for workspace .*? \(pid=(\d+)\)",
+        log_path.read_text(),
+    )
+    if not matches:
+        raise AssertionError(f"no runner PID found in {log_path}: {log_path.read_text()}")
+    return int(matches[-1])
+
+
+def _run_turn(
+    client: httpx.Client,
+    *,
+    session_id: str,
+    prompt: str,
+    expected: str,
+) -> None:
+    """Send one turn and wait for the expected assistant marker."""
+    response_id = send_user_message_to_session(client, session_id=session_id, content=prompt)
+    body = poll_session_until_terminal(
+        client,
+        session_id=session_id,
+        response_id=response_id,
+        timeout=120,
+    )
+    assert body["status"] == "completed", body
+    assert expected in final_assistant_text(body), body
+
+
 def _wait_for_session_evicted(
     client: httpx.Client,
     session_id: str,
@@ -230,7 +297,22 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
     tmp_path: Path,
     mock_llm_server_url: str,
 ) -> None:
-    """Real server + real host daemon exercise fixed-pool lifecycle."""
+    """Real server and host exercise new, warm-resume, and cold-resume paths."""
+    first_prompt = "POOL_FIRST_TURN_CONTEXT_ALPHA"
+    first_reply = "POOL_FIRST_REPLY_ALPHA"
+    warm_prompt = "POOL_WARM_RESUME_CONTEXT_BETA"
+    warm_reply = "POOL_WARM_REPLY_BETA"
+    cold_prompt = "POOL_COLD_RESUME_CONTEXT_GAMMA"
+    cold_reply = "POOL_COLD_REPLY_GAMMA"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": first_reply},
+            {"text": warm_reply},
+            {"text": cold_reply},
+        ],
+        key="gpt-5.4",
+    )
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     remote = _add_origin(repo)
@@ -247,7 +329,7 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
         mock_llm_server_url=mock_llm_server_url,
         host_config={
             "managed_worktrees": {
-                "idle_eviction_seconds": 1,
+                "idle_eviction_seconds": 5,
                 "repos": {
                     "universe": {
                         "base_branch": "main",
@@ -285,6 +367,12 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
         first_snapshot = pool_http_client.get(f"/v1/sessions/{first_session}").json()
         assert first_snapshot["workspace"] == "managed://universe"
         assert first_snapshot["git_branch"] == "pool-e2e/first"
+        _run_turn(
+            pool_http_client,
+            session_id=first_session,
+            prompt=first_prompt,
+            expected=first_reply,
+        )
         Path(slot, "agent-output.txt").write_text("saved before cleanup")
 
         blocked_session = _create_session(pool_http_client, agent_id)
@@ -303,13 +391,43 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
         assert blocked_launch.status_code == 409, blocked_launch.text
         assert "no available slots" in blocked_launch.text
 
-        first_pid = _runner_pid_from_daemon_log(daemon.daemon_log)
-        assert first_pid is not None, daemon.daemon_log.read_text()
+        first_pid = _latest_runner_pid(daemon.daemon_log)
         os.kill(first_pid, signal.SIGKILL)
         deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline and _pid_alive(first_pid):
             time.sleep(POLL_INTERVAL_S)
         assert not _pid_alive(first_pid), f"runner pid {first_pid} did not die"
+        _wait_for_runner_offline(pool_http_client, first_runner)
+
+        warm_turn = send_user_message_to_session(
+            pool_http_client,
+            session_id=first_session,
+            content=warm_prompt,
+        )
+        warm_runner = _wait_for_new_runner(pool_http_client, first_session, first_runner)
+        warm_body = poll_session_until_terminal(
+            pool_http_client,
+            session_id=first_session,
+            response_id=warm_turn,
+            timeout=120,
+        )
+        assert warm_body["status"] == "completed", warm_body
+        assert warm_reply in final_assistant_text(warm_body), warm_body
+        assert Path(slot, "agent-output.txt").read_text() == "saved before cleanup"
+        warm_requests = get_mock_requests(mock_llm_server_url, key="gpt-5.4")
+        assert len(warm_requests) >= 2, warm_requests
+        warm_input = str(warm_requests[-1])
+        assert first_prompt in warm_input
+        assert first_reply in warm_input
+
+        warm_pid = _latest_runner_pid(daemon.daemon_log)
+        assert warm_pid != first_pid
+        os.kill(warm_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and _pid_alive(warm_pid):
+            time.sleep(POLL_INTERVAL_S)
+        assert not _pid_alive(warm_pid), f"runner pid {warm_pid} did not die"
+        _wait_for_runner_offline(pool_http_client, warm_runner)
         _wait_for_session_evicted(
             pool_http_client,
             first_session,
@@ -322,24 +440,32 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
             == "saved before cleanup"
         )
 
-        reuse_session = _create_session(pool_http_client, agent_id)
-        reuse_launch = pool_http_client.post(
-            f"/v1/hosts/{daemon.host_id}/runners",
-            json={
-                "session_id": reuse_session,
-                "managed_repo": "universe",
-                "git": {
-                    "branch_name": "pool-e2e/reuse",
-                    "base_branch": "main",
-                },
-            },
-            timeout=60.0,
+        cold_turn = send_user_message_to_session(
+            pool_http_client,
+            session_id=first_session,
+            content=cold_prompt,
         )
-        reuse_launch.raise_for_status()
-        _wait_for_runner_online(pool_http_client, str(reuse_launch.json()["runner_id"]))
-        reuse_snapshot = pool_http_client.get(f"/v1/sessions/{reuse_session}").json()
-        assert reuse_snapshot["workspace"] == "managed://universe"
-        assert reuse_snapshot["git_branch"] == "pool-e2e/reuse"
+        cold_runner = _wait_for_new_runner(pool_http_client, first_session, None)
+        cold_body = poll_session_until_terminal(
+            pool_http_client,
+            session_id=first_session,
+            response_id=cold_turn,
+            timeout=120,
+        )
+        assert cold_body["status"] == "completed", cold_body
+        assert cold_reply in final_assistant_text(cold_body), cold_body
+        assert cold_runner != warm_runner
+        cold_snapshot = pool_http_client.get(f"/v1/sessions/{first_session}").json()
+        assert cold_snapshot["workspace"] == "managed://universe"
+        assert cold_snapshot["git_branch"] == "pool-e2e/first"
+        assert Path(slot, "agent-output.txt").read_text() == "saved before cleanup"
+        cold_requests = get_mock_requests(mock_llm_server_url, key="gpt-5.4")
+        assert len(cold_requests) >= 3, cold_requests
+        cold_input = str(cold_requests[-1])
+        assert first_prompt in cold_input
+        assert first_reply in cold_input
+        assert warm_prompt in cold_input
+        assert warm_reply in cold_input
     finally:
         if host_proc.poll() is None:
             host_proc.send_signal(signal.SIGTERM)

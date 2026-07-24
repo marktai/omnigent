@@ -129,6 +129,13 @@ no worktree-pool REST endpoint.
 The runner exposes the branch in its identity payload. Harnesses and tools can
 read it without learning how the host selected the worktree.
 
+The server's durable session snapshot continues to expose `managed://<repo>`.
+When the runner initializes, it replaces that logical marker with its
+host-provided `OMNIGENT_RUNNER_WORKSPACE` for local filesystem, terminal, and
+transcript paths. The host does not receive conversation history. Resume-capable
+runners fetch committed session items from the server and rebuild or reopen the
+harness-specific transcript in the assigned physical workspace.
+
 ## Capacity
 
 A configured worktree can be in one of three states:
@@ -260,13 +267,16 @@ Unit tests cover:
 - frame round trips for launch intent, resolved workspace, branch, and release
   notification;
 - server persistence of the managed repository marker and branch;
+- runner translation from the managed marker to its physical workspace;
+- warm and post-eviction resume with prior transcript history;
 - `409 Conflict` for exhausted capacity.
 
 The local end-to-end test starts a real server and host against temporary git
-repositories and precreated worktrees. It launches a managed session, writes a
-file through the assigned workspace, stops the runner, waits for idle eviction,
-verifies the commit on the bare remote, and launches another session into the
-same restored slot.
+repositories and precreated worktrees. It launches a managed session, completes
+a turn, restarts the runner inside the idle-retention window, verifies prior
+history reaches the warm resume, then evicts the lease. It verifies the commit
+on the bare remote, cold-resumes the same branch into the restored slot, and
+confirms the full prior transcript reaches the new runner.
 
 ## Rollout
 

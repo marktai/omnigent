@@ -53,6 +53,7 @@ from omnigent.llms.summarize import (
     build_summarization_prompt,
     extract_summary_text,
 )
+from omnigent.managed_workspace import parse_managed_workspace
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals
@@ -2258,6 +2259,14 @@ def create_runner_app(
 
     _session_fs_registries: dict[str, FilesystemRegistry] = {}
 
+    def _local_workspace(workspace: str | None) -> str | None:
+        """Resolve a managed binding to the physical workspace of this runner."""
+        if workspace is None or parse_managed_workspace(workspace) is None:
+            return workspace
+        if runner_workspace is None:
+            raise ValueError("managed session initialization requires runner workspace")
+        return str(runner_workspace.resolve())
+
     async def _session_snapshot(session_id: str) -> _SessionSnapshot:
         cached = _session_snapshot_cache.get(session_id)
         if cached is not None:
@@ -2282,7 +2291,7 @@ def create_runner_app(
                     raw_created = body.get("created_at")
                     if raw_created is not None:
                         created_at = float(raw_created)
-                    workspace = body.get("workspace")
+                    workspace = _local_workspace(body.get("workspace"))
                     raw_agent_id = body.get("agent_id")
                     if isinstance(raw_agent_id, str) and raw_agent_id:
                         agent_id = raw_agent_id
@@ -2339,6 +2348,10 @@ def create_runner_app(
         global _server_version
         _server_version = envelope.server_version
         snapshot = envelope.snapshot
+        local_workspace = _local_workspace(snapshot.workspace)
+        if local_workspace != snapshot.workspace:
+            snapshot = snapshot.model_copy(update={"workspace": local_workspace})
+            envelope = envelope.model_copy(update={"snapshot": snapshot})
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
             status_code=200,
