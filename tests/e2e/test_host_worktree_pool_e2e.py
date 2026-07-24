@@ -323,6 +323,42 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
         check=True,
         capture_output=True,
     )
+    updater = tmp_path / "base-updater"
+    subprocess.run(
+        ["git", "clone", "-q", "-b", "main", str(remote), str(updater)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "pool-e2e@example.com"], cwd=updater, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Pool E2E"], cwd=updater, check=True)
+    Path(updater, "latest-base.txt").write_text("fetched before session launch\n")
+    subprocess.run(["git", "add", "latest-base.txt"], cwd=updater, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "advance managed base"],
+        cwd=updater,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "push", "origin", "main"], cwd=updater, check=True, capture_output=True)
+    latest_base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=updater,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "origin/main"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        != latest_base
+    )
     daemon = _spawn_host_daemon(
         tmp_path=tmp_path,
         live_server=pool_live_server,
@@ -332,7 +368,7 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
                 "idle_eviction_seconds": 5,
                 "repos": {
                     "universe": {
-                        "base_branch": "main",
+                        "base_branch": "origin/main",
                         "branch_remote": "origin",
                         "worktrees": [str(slot)],
                     }
@@ -344,6 +380,20 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
 
     try:
         _wait_for_host_online(pool_http_client, daemon.host_id, timeout=30.0)
+        deadline = time.monotonic() + 15.0
+        refreshed_base = ""
+        while time.monotonic() < deadline:
+            refreshed_base = subprocess.run(
+                ["git", "rev-parse", "origin/main"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if refreshed_base == latest_base:
+                break
+            time.sleep(POLL_INTERVAL_S)
+        assert refreshed_base == latest_base
         agent_name = upload_agent(pool_http_client, _write_smoke_agent_yaml(tmp_path))
         agent_id = lookup_agent_id(pool_http_client, agent_name)
 
@@ -367,6 +417,7 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
         first_snapshot = pool_http_client.get(f"/v1/sessions/{first_session}").json()
         assert first_snapshot["workspace"] == "managed://universe"
         assert first_snapshot["git_branch"] == "pool-e2e/first"
+        assert Path(slot, "latest-base.txt").read_text() == "fetched before session launch\n"
         _run_turn(
             pool_http_client,
             session_id=first_session,
@@ -466,6 +517,7 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
         assert first_reply in cold_input
         assert warm_prompt in cold_input
         assert warm_reply in cold_input
+
     finally:
         if host_proc.poll() is None:
             host_proc.send_signal(signal.SIGTERM)

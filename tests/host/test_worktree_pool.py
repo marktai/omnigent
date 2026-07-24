@@ -6,9 +6,11 @@ import os
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import call, patch
 
 import pytest
 
+import omnigent.host.worktree_pool as worktree_pool
 from omnigent.host.worktree_pool import (
     ManagedWorktreeConfig,
     ManagedWorktreeRepo,
@@ -207,3 +209,117 @@ def test_managed_pool_idle_eviction_pushes_and_reuses_slot(git_repo: Path) -> No
 
     assert second.worktree_path == first.worktree_path
     assert _git_bare(remote, "show", "refs/heads/feature/one:result.txt") == "done\n"
+
+
+def test_managed_pool_idle_eviction_pushes_clean_unpushed_commit(git_repo: Path) -> None:
+    remote = _add_origin(git_repo)
+    paths = _precreate_worktrees(git_repo, 1)
+    manager = WorktreePoolManager()
+    manager.adopt_managed_config(_managed_config(git_repo, paths, idle=0))
+    acquired = manager.acquire_managed(
+        repo_id="universe",
+        branch_name="feature/clean-commit",
+        session_id="session-clean",
+        runner_id="runner-clean",
+    )
+    worktree = Path(acquired.worktree_path)
+    (worktree / "committed.txt").write_text("committed before eviction\n")
+    _git(worktree, "add", "committed.txt")
+    _git(worktree, "commit", "-m", "clean local commit")
+    assert not _git(worktree, "status", "--porcelain")
+
+    manager.mark_runner_idle("runner-clean")
+    assert manager.evict_idle_managed() == ["session-clean"]
+
+    assert (
+        _git_bare(remote, "show", "refs/heads/feature/clean-commit:committed.txt")
+        == "committed before eviction\n"
+    )
+
+
+def test_refresh_managed_bases_updates_remote_tracking_ref(git_repo: Path) -> None:
+    remote = _add_origin(git_repo)
+    paths = _precreate_worktrees(git_repo, 1)
+    updater = git_repo.parent / "updater"
+    subprocess.run(
+        ["git", "clone", "-q", "-b", "main", str(remote), str(updater)],
+        check=True,
+        capture_output=True,
+    )
+    _git(updater, "config", "user.email", "pool-test@example.com")
+    _git(updater, "config", "user.name", "Pool Test")
+    (updater / "latest.txt").write_text("latest base\n")
+    _git(updater, "add", "latest.txt")
+    _git(updater, "commit", "-q", "-m", "advance base")
+    _git(updater, "push", "origin", "main")
+    expected = _git(updater, "rev-parse", "HEAD").strip()
+    assert _git(git_repo, "rev-parse", "origin/main").strip() != expected
+
+    manager = WorktreePoolManager()
+    manager.adopt_managed_config(
+        ManagedWorktreeConfig(
+            repos=(
+                ManagedWorktreeRepo(
+                    repo_id="universe",
+                    repo_root=str(git_repo),
+                    base_branch="origin/main",
+                    branch_remote="origin",
+                    worktrees=tuple(str(path) for path in paths),
+                ),
+            )
+        )
+    )
+
+    assert manager.refresh_managed_bases() == {"universe": "origin/main"}
+    assert _git(git_repo, "rev-parse", "origin/main").strip() == expected
+
+
+def test_run_git_with_backoff_retries_transient_failure() -> None:
+    transient = subprocess.CompletedProcess(
+        args=["git", "fetch"],
+        returncode=1,
+        stdout="",
+        stderr="fatal: cannot lock ref 'refs/remotes/origin/main'",
+    )
+    success = subprocess.CompletedProcess(
+        args=["git", "fetch"],
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    with (
+        patch.object(worktree_pool, "_run_git", side_effect=[transient, transient, success]),
+        patch.object(worktree_pool.time, "sleep") as sleep,
+    ):
+        result = worktree_pool._run_git_with_backoff(
+            ["fetch", "origin", "main"],
+            cwd="/repo",
+            operation="fetch managed base origin/main",
+        )
+
+    assert result.returncode == 0
+    assert sleep.call_args_list == [call(0.5), call(1.0)]
+
+
+def test_run_git_with_backoff_does_not_retry_permanent_failure() -> None:
+    missing = subprocess.CompletedProcess(
+        args=["git", "fetch"],
+        returncode=128,
+        stdout="",
+        stderr="fatal: couldn't find remote ref feature/missing",
+    )
+
+    with (
+        patch.object(worktree_pool, "_run_git", return_value=missing) as run_git,
+        patch.object(worktree_pool.time, "sleep") as sleep,
+    ):
+        result = worktree_pool._run_git_with_backoff(
+            ["fetch", "origin", "feature/missing"],
+            cwd="/repo",
+            operation="fetch session branch origin/feature/missing",
+        )
+
+    assert result is missing
+    run_git.assert_called_once()
+    sleep.assert_not_called()

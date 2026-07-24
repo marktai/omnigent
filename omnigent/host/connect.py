@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -291,6 +292,15 @@ def _url_is_loopback(url: str) -> bool:
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 10.0
 _RECONNECT_JITTER = 0.5
+_MANAGED_BASE_REFRESH_INTERVAL_S = 60 * 60
+_MANAGED_BASE_REFRESH_MAX_JITTER_S = 5 * 60
+
+
+def _stable_managed_base_refresh_jitter_s(host_id: str) -> int:
+    """Spread hourly managed-base refreshes consistently across hosts."""
+    digest = hashlib.sha256(host_id.encode()).digest()
+    return int.from_bytes(digest[:8], byteorder="big") % _MANAGED_BASE_REFRESH_MAX_JITTER_S
+
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -725,10 +735,15 @@ class HostProcess:
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
         self._worktree_pool = WorktreePoolManager()
+        self._managed_worktrees_enabled = managed_worktrees is not None
         if managed_worktrees is not None:
             self._worktree_pool.adopt_managed_config(managed_worktrees)
         self._managed_lease_by_runner: dict[str, str] = {}
         self._managed_eviction_task: asyncio.Task[None] | None = None
+        self._managed_base_refresh_task: asyncio.Task[None] | None = None
+        self._managed_base_refresh_jitter_s = _stable_managed_base_refresh_jitter_s(
+            identity.host_id
+        )
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
@@ -2007,6 +2022,11 @@ class HostProcess:
             self._managed_worktree_eviction_loop(),
             name="host-managed-worktree-eviction",
         )
+        if self._managed_worktrees_enabled:
+            self._managed_base_refresh_task = asyncio.create_task(
+                self._managed_worktree_base_refresh_loop(),
+                name="host-managed-worktree-base-refresh",
+            )
         backoff = _RECONNECT_BASE_S
         try:
             while True:
@@ -2084,6 +2104,9 @@ class HostProcess:
             if self._managed_eviction_task is not None:
                 self._managed_eviction_task.cancel()
                 self._managed_eviction_task = None
+            if self._managed_base_refresh_task is not None:
+                self._managed_base_refresh_task.cancel()
+                self._managed_base_refresh_task = None
             self._cleanup_runners()
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool
@@ -2108,6 +2131,25 @@ class HostProcess:
                 raise
             except Exception:
                 _logger.exception("managed worktree eviction sweep failed")
+
+    async def _managed_worktree_base_refresh_loop(self) -> None:
+        """Keep configured remote-tracking base refs fresh in the background."""
+        while True:
+            try:
+                refreshed = await asyncio.to_thread(self._worktree_pool.refresh_managed_bases)
+                for repo_id, base_branch in refreshed.items():
+                    _logger.info(
+                        "Refreshed managed worktree base %s for repository %s",
+                        base_branch,
+                        repo_id,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.exception("managed worktree base refresh failed")
+            await asyncio.sleep(
+                _MANAGED_BASE_REFRESH_INTERVAL_S + self._managed_base_refresh_jitter_s
+            )
 
     def _cleanup_runners(self) -> None:
         """Terminate all live runners on shutdown.

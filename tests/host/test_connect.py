@@ -96,6 +96,30 @@ async def test_handle_model_options_uses_host_claude_configuration(
     )
 
 
+async def test_managed_worktree_base_refresh_loop_runs_immediately() -> None:
+    host = _make_host_process()
+    called = asyncio.Event()
+
+    def refresh() -> dict[str, str]:
+        called.set()
+        return {"universe": "mirror/master"}
+
+    with patch.object(host._worktree_pool, "refresh_managed_bases", side_effect=refresh):
+        task = asyncio.create_task(host._managed_worktree_base_refresh_loop())
+        await asyncio.wait_for(called.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_managed_worktree_base_refresh_jitter_is_stable_per_host() -> None:
+    first = _make_host_process()
+    second = _make_host_process()
+
+    assert first._managed_base_refresh_jitter_s == second._managed_base_refresh_jitter_s
+    assert 0 <= first._managed_base_refresh_jitter_s < 5 * 60
+
+
 def _make_host_process() -> HostProcess:
     """Create a HostProcess with a test identity.
 

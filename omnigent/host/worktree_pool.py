@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import subprocess
@@ -20,6 +21,27 @@ from omnigent.host.git_worktree import (
     _main_work_tree,
     _run_git,
     validate_branch_name,
+)
+
+_logger = logging.getLogger(__name__)
+
+_GIT_NETWORK_MAX_ATTEMPTS = 3
+_GIT_NETWORK_RETRY_BASE_DELAY_S = 0.5
+_GIT_NETWORK_RETRY_CAP_S = 2.0
+_RETRIABLE_GIT_FAILURES = (
+    "cannot lock ref",
+    "unable to update local ref",
+    "rpc failed",
+    "unexpected disconnect",
+    "remote end hung up",
+    "broken pipe",
+    "connection reset",
+    "connection refused",
+    "connection timed out",
+    "could not resolve host",
+    "failed to connect",
+    "temporary failure in name resolution",
+    "the requested url returned error: 5",
 )
 
 
@@ -201,6 +223,32 @@ class WorktreePoolManager:
             lease = self._leases_by_session.get(session_id)
             return lease.worktree_path if lease is not None else None
 
+    def refresh_managed_bases(self) -> dict[str, str]:
+        """Fetch configured remote-tracking base refs for managed repositories."""
+        refreshed: dict[str, str] = {}
+        failures: list[str] = []
+        with self._lock:
+            for repo in self._managed_pools.values():
+                remote_branch = _remote_tracking_branch(repo.repo_root, repo.base_branch)
+                if remote_branch is None:
+                    continue
+                remote, branch, destination = remote_branch
+                result = _run_git_with_backoff(
+                    ["fetch", remote, f"+refs/heads/{branch}:{destination}"],
+                    cwd=repo.repo_root,
+                    operation=f"fetch managed base {repo.base_branch}",
+                )
+                if result.returncode != 0:
+                    failures.append(
+                        f"{repo.repo_id} ({repo.base_branch}): "
+                        f"{_git_error('git fetch managed base failed', result).message}"
+                    )
+                    continue
+                refreshed[repo.repo_id] = repo.base_branch
+        if failures:
+            raise WorktreePoolError("; ".join(failures))
+        return refreshed
+
     def evict_idle_managed(self) -> list[str]:
         """Finalize and release sessions idle longer than the configured limit."""
         with self._lock:
@@ -240,16 +288,17 @@ class WorktreePoolManager:
         branch_name: str,
     ) -> None:
         remote_ref = f"refs/remotes/{repo.branch_remote}/{branch_name}"
-        fetch = _run_git(
+        fetch = _run_git_with_backoff(
             ["fetch", repo.branch_remote, f"{branch_name}:{remote_ref}"],
             cwd=worktree_path,
+            operation=f"fetch session branch {repo.branch_remote}/{branch_name}",
         )
         if fetch.returncode == 0:
             result = _run_git(
                 ["checkout", "-B", branch_name, f"{repo.branch_remote}/{branch_name}"],
                 cwd=worktree_path,
             )
-        else:
+        elif _fetch_ref_is_missing(fetch):
             local = _run_git(
                 ["show-ref", "--verify", f"refs/heads/{branch_name}"],
                 cwd=worktree_path,
@@ -261,6 +310,8 @@ class WorktreePoolManager:
                     ["checkout", "-b", branch_name, "--end-of-options", repo.base_branch],
                     cwd=worktree_path,
                 )
+        else:
+            raise _git_error("git fetch session branch failed", fetch)
         if result.returncode != 0:
             raise _git_error("git checkout session branch failed", result)
 
@@ -286,9 +337,6 @@ class WorktreePoolManager:
         )
         if status.returncode != 0:
             raise _git_error("git status failed", status)
-        if not status.stdout.strip():
-            return
-
         current_branch = _run_git(["branch", "--show-current"], cwd=lease.worktree_path)
         if current_branch.returncode != 0:
             raise _git_error("git branch --show-current failed", current_branch)
@@ -305,22 +353,22 @@ class WorktreePoolManager:
                 f"remote {lease.branch_remote!r} is not configured"
             )
 
-        _run_git_with_lock_recovery(["add", "-A"], cwd=lease.worktree_path)
-        staged = _run_git(["diff", "--cached", "--quiet"], cwd=lease.worktree_path)
-        if staged.returncode == 0:
-            return
-        if staged.returncode != 1:
-            raise _git_error("git diff --cached failed", staged)
+        if status.stdout.strip():
+            _run_git_with_lock_recovery(["add", "-A"], cwd=lease.worktree_path)
+            staged = _run_git(["diff", "--cached", "--quiet"], cwd=lease.worktree_path)
+            if staged.returncode not in {0, 1}:
+                raise _git_error("git diff --cached failed", staged)
+            if staged.returncode == 1:
+                # TODO: Generate a commit message from the staged diff and session context.
+                message = f"Omnigent session {lease.session_id}"
+                commit = _run_git(["commit", "-m", message], cwd=lease.worktree_path)
+                if commit.returncode != 0:
+                    raise _git_error("git commit failed", commit)
 
-        # TODO: Generate a commit message from the staged diff and session context.
-        message = f"Omnigent session {lease.session_id}"
-        commit = _run_git(["commit", "-m", message], cwd=lease.worktree_path)
-        if commit.returncode != 0:
-            raise _git_error("git commit failed", commit)
-
-        push = _run_git(
+        push = _run_git_with_backoff(
             ["push", lease.branch_remote, f"HEAD:refs/heads/{lease.branch}"],
             cwd=lease.worktree_path,
+            operation=f"push session branch {lease.branch_remote}/{lease.branch}",
         )
         if push.returncode != 0:
             raise _git_error("git push failed", push)
@@ -331,6 +379,54 @@ def _repo_root(repo_path: str) -> str:
         return _main_work_tree(repo_path)
     except WorktreeError as exc:
         raise WorktreePoolError(exc.message) from exc
+
+
+def _remote_tracking_branch(repo_root: str, base_branch: str) -> tuple[str, str, str] | None:
+    normalized = base_branch.removeprefix("refs/remotes/")
+    remote, separator, branch = normalized.partition("/")
+    if not separator or not remote or not branch:
+        return None
+    configured = _run_git(["remote", "get-url", remote], cwd=repo_root)
+    if configured.returncode != 0:
+        return None
+    return remote, branch, f"refs/remotes/{remote}/{branch}"
+
+
+def _run_git_with_backoff(
+    args: list[str],
+    *,
+    cwd: str,
+    operation: str,
+) -> subprocess.CompletedProcess[str]:
+    """Retry transient fetch and push failures with bounded exponential backoff."""
+    result = _run_git(args, cwd=cwd)
+    for attempt in range(1, _GIT_NETWORK_MAX_ATTEMPTS):
+        if result.returncode == 0 or not _git_failure_is_retriable(result):
+            return result
+        delay = min(
+            _GIT_NETWORK_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
+            _GIT_NETWORK_RETRY_CAP_S,
+        )
+        _logger.warning(
+            "%s failed transiently; retrying attempt %d/%d in %.1fs",
+            operation,
+            attempt + 1,
+            _GIT_NETWORK_MAX_ATTEMPTS,
+            delay,
+        )
+        time.sleep(delay)
+        result = _run_git(args, cwd=cwd)
+    return result
+
+
+def _git_failure_is_retriable(result: subprocess.CompletedProcess[str]) -> bool:
+    output = f"{result.stdout}\n{result.stderr}".casefold()
+    return any(marker in output for marker in _RETRIABLE_GIT_FAILURES)
+
+
+def _fetch_ref_is_missing(result: subprocess.CompletedProcess[str]) -> bool:
+    output = f"{result.stdout}\n{result.stderr}".casefold()
+    return "couldn't find remote ref" in output or "remote ref does not exist" in output
 
 
 def _acquired(lease: _Lease) -> AcquiredWorktree:

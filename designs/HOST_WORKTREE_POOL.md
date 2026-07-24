@@ -20,7 +20,7 @@ only orchestrates sessions and runners.
 - Reuse worktrees without creating or deleting them at runtime.
 - Keep a session on the same worktree across runner restarts.
 - Resume a pushed session branch when a session gets a new worktree.
-- Commit and push dirty work before destructive cleanup.
+- Commit dirty work and push the session branch before destructive cleanup.
 - Reset released worktrees to a known detached base state.
 - Keep the existing user-created worktree APIs unchanged.
 
@@ -47,11 +47,11 @@ host:
     idle_eviction_seconds: 3600
     repos:
       universe:
-        base_branch: origin/main
+        base_branch: mirror/master
         branch_remote: origin
         worktrees:
-          - /home/user/universe-isaac-1
-          - /home/user/universe-isaac-2
+          - /home/user/universe-omnigent-1
+          - /home/user/universe-omnigent-2
 ```
 
 Each key under `repos` is a server-visible repository ID. The host infers the
@@ -66,11 +66,21 @@ common git repository from the configured worktrees and rejects startup when:
 `branch_remote` defaults to `origin`. The number of paths is both the pool size
 and the hard concurrency limit. No runtime request can increase it.
 
+At startup and every hour plus a stable per-host jitter of up to five minutes,
+the host refreshes configured
+remote-tracking base refs such as `mirror/master` with an explicit fetch into
+`refs/remotes/mirror/master`. Refresh runs in the background and uses the same
+pool lock as assignment and cleanup, so a new session cannot prepare a branch
+from the ref while it is being updated. Local-only base refs such as `main`
+remain valid but are not updated by this background job. Managed fetches and
+pushes retry transient ref-lock and transport failures three times with bounded
+exponential backoff.
+
 The operator creates these worktrees before starting the host. For example:
 
 ```bash
-git -C ~/universe worktree add --detach ~/universe-isaac-1 origin/main
-git -C ~/universe worktree add --detach ~/universe-isaac-2 origin/main
+git -C ~/universe worktree add --detach ~/universe-omnigent-1 mirror/master
+git -C ~/universe worktree add --detach ~/universe-omnigent-2 mirror/master
 omnigent host
 ```
 
@@ -181,9 +191,10 @@ For each eligible session, the host:
 
 1. verifies that the expected session branch is checked out;
 2. checks for tracked and untracked changes;
-3. stages all changes with `git add -A`;
-4. commits staged changes as `Omnigent session <session_id>`;
-5. pushes `HEAD` to the configured branch on `branch_remote`;
+3. when dirty, stages all changes with `git add -A`;
+4. when staged changes exist, commits them as `Omnigent session <session_id>`;
+5. always pushes `HEAD` to the configured branch on `branch_remote`, including
+   clean branches with commits created by the agent;
 6. aborts merge or rebase state;
 7. removes a stale index lock only when no git process is active;
 8. runs `git reset --hard`;
@@ -262,7 +273,8 @@ Unit tests cover:
 - fixed-capacity rejection;
 - session affinity across runner restarts;
 - branch creation and remote branch resume;
-- dirty-work commit and push before cleanup;
+- startup and hourly refresh of remote-tracking base refs;
+- dirty-work commit and clean-or-dirty branch push before cleanup;
 - hard reset, `clean -ffd`, detached-base restore, and slot reuse;
 - frame round trips for launch intent, resolved workspace, branch, and release
   notification;
