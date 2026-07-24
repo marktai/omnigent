@@ -294,7 +294,7 @@ async def test_managed_repo_launch_delegates_worktree_selection_to_host(
     assert cap.launch[0].git_branch == "feature/managed"
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
-    assert conv.workspace == "/home/alice/universe-managed-1"
+    assert conv.workspace == "managed://universe"
     assert conv.git_branch == "feature/managed"
 
 

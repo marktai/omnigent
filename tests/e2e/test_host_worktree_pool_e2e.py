@@ -196,12 +196,15 @@ def _wait_for_runner_online(client: httpx.Client, runner_id: str, timeout: float
     raise AssertionError(f"runner {runner_id!r} did not come online")
 
 
-def _wait_for_session_unbound(
+def _wait_for_session_evicted(
     client: httpx.Client,
     session_id: str,
+    host_id: str,
+    workspace: str,
+    git_branch: str,
     timeout: float = 30.0,
 ) -> dict:
-    """Poll until idle eviction clears the session's host binding."""
+    """Poll until idle eviction clears only the session's runner binding."""
     deadline = time.monotonic() + timeout
     last: dict | None = None
     while time.monotonic() < deadline:
@@ -211,9 +214,9 @@ def _wait_for_session_unbound(
         labels = last.get("labels") or {}
         if (
             last.get("runner_id") is None
-            and last.get("host_id") is None
-            and last.get("workspace") is None
-            and last.get("git_branch") is None
+            and last.get("host_id") == host_id
+            and last.get("workspace") == workspace
+            and last.get("git_branch") == git_branch
             and "omnigent.worktree_pool.lease_id" not in labels
         ):
             return last
@@ -280,9 +283,9 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
         _wait_for_runner_online(pool_http_client, first_runner)
 
         first_snapshot = pool_http_client.get(f"/v1/sessions/{first_session}").json()
-        assert first_snapshot["workspace"] == str(slot)
+        assert first_snapshot["workspace"] == "managed://universe"
         assert first_snapshot["git_branch"] == "pool-e2e/first"
-        Path(first_snapshot["workspace"], "agent-output.txt").write_text("saved before cleanup")
+        Path(slot, "agent-output.txt").write_text("saved before cleanup")
 
         blocked_session = _create_session(pool_http_client, agent_id)
         blocked_launch = pool_http_client.post(
@@ -307,7 +310,13 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
         while time.monotonic() < deadline and _pid_alive(first_pid):
             time.sleep(POLL_INTERVAL_S)
         assert not _pid_alive(first_pid), f"runner pid {first_pid} did not die"
-        _wait_for_session_unbound(pool_http_client, first_session)
+        _wait_for_session_evicted(
+            pool_http_client,
+            first_session,
+            daemon.host_id,
+            "managed://universe",
+            "pool-e2e/first",
+        )
         assert (
             _git_bare(remote, "show", "refs/heads/pool-e2e/first:agent-output.txt")
             == "saved before cleanup"
@@ -329,7 +338,7 @@ def test_host_worktree_pool_capacity_eviction_and_reuse(
         reuse_launch.raise_for_status()
         _wait_for_runner_online(pool_http_client, str(reuse_launch.json()["runner_id"]))
         reuse_snapshot = pool_http_client.get(f"/v1/sessions/{reuse_session}").json()
-        assert reuse_snapshot["workspace"] == str(slot)
+        assert reuse_snapshot["workspace"] == "managed://universe"
         assert reuse_snapshot["git_branch"] == "pool-e2e/reuse"
     finally:
         if host_proc.poll() is None:

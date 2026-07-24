@@ -2530,11 +2530,11 @@ def create_app(
             _publish_status(session_id, "failed", error=detail)
 
     async def _on_managed_session_released(host_id: str, session_id: str) -> None:
-        """Clear a binding after its host finalizes the managed worktree."""
+        """Clear the runner after its host releases the physical worktree."""
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None or conv.host_id != host_id:
             return
-        await asyncio.to_thread(conversation_store.clear_host_binding, session_id)
+        await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.

@@ -151,6 +151,7 @@ def test_managed_pool_adopts_fixed_worktrees_and_resumes_session(git_repo: Path)
 
     assert resumed.lease_id == first.lease_id
     assert resumed.worktree_path == first.worktree_path
+    assert manager.workspace_for_session("session-1") == first.worktree_path
     assert second.worktree_path != first.worktree_path
     assert _worktree_count(git_repo) == 3
     with pytest.raises(WorktreePoolError, match="no available slots"):
@@ -159,6 +160,27 @@ def test_managed_pool_adopts_fixed_worktrees_and_resumes_session(git_repo: Path)
             branch_name="feature/three",
             session_id="session-3",
             runner_id="runner-4",
+        )
+
+
+def test_managed_pool_rejects_duplicate_branch_binding(git_repo: Path) -> None:
+    _add_origin(git_repo)
+    paths = _precreate_worktrees(git_repo, 2)
+    manager = WorktreePoolManager()
+    manager.adopt_managed_config(_managed_config(git_repo, paths))
+    manager.acquire_managed(
+        repo_id="universe",
+        branch_name="feature/shared",
+        session_id="session-1",
+        runner_id="runner-1",
+    )
+
+    with pytest.raises(WorktreePoolError, match="already bound to session 'session-1'"):
+        manager.acquire_managed(
+            repo_id="universe",
+            branch_name="feature/shared",
+            session_id="session-2",
+            runner_id="runner-2",
         )
 
 

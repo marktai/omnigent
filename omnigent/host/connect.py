@@ -73,6 +73,7 @@ from omnigent.host.worktree_pool import (
     WorktreePoolManager,
     load_managed_worktree_config,
 )
+from omnigent.managed_workspace import parse_managed_workspace
 from omnigent.onboarding.harness_install import (
     harness_cli_installed,
     harness_setup_hint,
@@ -1142,15 +1143,17 @@ class HostProcess:
                     runner_id=runner_id,
                 )
             except (WorktreePoolError, WorktreeError) as exc:
+                if "no available slots" in str(exc):
+                    error_code = "managed_worktree_capacity"
+                elif "already bound to session" in str(exc):
+                    error_code = "managed_worktree_branch_conflict"
+                else:
+                    error_code = "managed_worktree_prepare_failed"
                 return HostLaunchRunnerResultFrame(
                     request_id=frame.request_id,
                     status="failed",
                     error=str(exc),
-                    error_code=(
-                        "managed_worktree_capacity"
-                        if "no available slots" in str(exc)
-                        else "managed_worktree_prepare_failed"
-                    ),
+                    error_code=error_code,
                 )
             workspace = Path(managed_lease.worktree_path)
         else:
@@ -1712,7 +1715,19 @@ class HostProcess:
         from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
         try:
-            expanded = os.path.expanduser(frame.workspace)
+            managed_repo = parse_managed_workspace(frame.workspace)
+            if managed_repo is not None:
+                expanded = self._worktree_pool.workspace_for_session(frame.session_id)
+                if expanded is None:
+                    return HostFsResultFrame(
+                        request_id=frame.request_id,
+                        status="error",
+                        error_status=404,
+                        error_code="not_found",
+                        error="managed session has no active worktree lease",
+                    )
+            else:
+                expanded = os.path.expanduser(frame.workspace)
         except (TypeError, ValueError) as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,

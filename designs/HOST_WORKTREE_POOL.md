@@ -8,8 +8,8 @@ lease, reset, or release them.
 An operator starts a host with a fixed list of existing git worktrees. When the
 server asks the host to start or resume a session for a named repository, the
 host selects a worktree, prepares the session branch, and starts the runner in
-that directory. The host returns the resolved workspace and branch so the
-server can persist them for display and routing.
+that directory. The server persists only the repository alias and branch; the
+host keeps the physical worktree path private.
 
 This keeps execution policy on the machine that owns the filesystem. The server
 only orchestrates sessions and runners.
@@ -108,9 +108,9 @@ no worktree-pool REST endpoint.
 
 1. The server atomically binds a runner ID to the session.
 2. The server sends start or resume intent to the host.
-3. The host checks whether the session already owns a worktree.
-4. If it does, the host clears the idle timestamp and restarts the runner in the
-   same directory.
+3. The host checks whether it still has a transient lease for the session.
+4. If the lease is still inside the idle-retention window, the host clears the
+   idle timestamp and restarts the runner in that slot.
 5. Otherwise, the host selects an unassigned configured worktree.
 6. The host aborts stale merge or rebase state, removes a stale index lock only
    when no git process is active, runs `git reset --hard`, runs
@@ -122,9 +122,9 @@ no worktree-pool REST endpoint.
 9. The host starts the runner with the selected worktree as
    `OMNIGENT_RUNNER_WORKSPACE` and the branch as `OMNIGENT_RUNNER_GIT_BRANCH`.
 10. The host returns the actual workspace and branch in
-    `host.launch_runner_result`.
-11. The server replaces its temporary managed workspace marker with the actual
-    values returned by the host.
+    `host.launch_runner_result` for launch diagnostics.
+11. The server retains `managed://<repo>` as the durable workspace binding and
+    stores the branch separately. It never persists the physical worktree path.
 
 The runner exposes the branch in its identity payload. Harnesses and tools can
 read it without learning how the host selected the worktree.
@@ -160,6 +160,11 @@ assignment.
 The server continues to own runner connection state. A disconnected runner can
 be relaunched, but the server does not decide which worktree to use.
 
+The session has no durable affinity to a physical worktree. Its durable identity
+is the repository alias plus branch. A physical slot is only retained while the
+runner is active or during the idle-retention window. After eviction, the host
+may resume the branch in any available configured slot.
+
 ## Idle eviction
 
 The host runs a cleanup sweep every 15 seconds. A session becomes eligible when
@@ -181,9 +186,11 @@ For each eligible session, the host:
 12. removes the host-local session assignment;
 13. sends `host.managed_session_released` to the server.
 
-The server clears the session binding only when the notification comes from the
-host currently stored on that session. A delayed notification from an old host
-cannot clear a newer binding.
+The server clears only `runner_id` when the notification comes from the host
+currently stored on that session. It retains `host_id`, `managed://<repo>`, and
+`git_branch`, so a later message can ask the same host to resume that branch in
+any available slot. A delayed notification from an old host cannot affect a
+newer binding.
 
 If commit, push, reset, or cleanup fails, the host keeps the assignment and
 quarantines the worktree. It does not notify the server or hand the directory to
@@ -235,8 +242,9 @@ Host logs record:
 - cleanup and quarantine results;
 - eviction notifications sent to the server.
 
-The launch response persists the resolved workspace and branch in the session
-row, so existing session inspection and UI surfaces show the host's decision.
+The launch response keeps the physical workspace host-local and persists the
+managed repository marker plus branch in the session row, so existing session
+inspection and UI surfaces show the host's decision.
 
 ## Testing
 
@@ -251,7 +259,7 @@ Unit tests cover:
 - hard reset, `clean -ffd`, detached-base restore, and slot reuse;
 - frame round trips for launch intent, resolved workspace, branch, and release
   notification;
-- server persistence of the workspace and branch returned by the host;
+- server persistence of the managed repository marker and branch;
 - `409 Conflict` for exhausted capacity.
 
 The local end-to-end test starts a real server and host against temporary git

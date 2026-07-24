@@ -73,6 +73,7 @@ from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.managed_workspace import parse_managed_workspace
 from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_terminal_name,
@@ -673,11 +674,20 @@ def create_sessions_router(
                         "schema constraint should have prevented this",
                         code=ErrorCode.INTERNAL_ERROR,
                     )
+                try:
+                    managed_repo = parse_managed_workspace(resp.workspace)
+                except ValueError as exc:
+                    raise OmnigentError(
+                        "session has an invalid managed workspace marker",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    ) from exc
                 launch_frame = encode_host_frame(
                     HostLaunchRunnerFrame(
                         request_id=request_id,
                         binding_token=binding_token,
                         workspace=resp.workspace,
+                        git_branch=resp.git_branch if managed_repo is not None else None,
+                        managed_repo=managed_repo,
                         session_id=resp.id,
                         # Already canonical (see _resolve_harness); lets
                         # the host refuse an unconfigured harness before

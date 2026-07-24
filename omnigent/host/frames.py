@@ -660,8 +660,9 @@ class HostFsRequestFrame:
     :param request_id: Correlates the result, e.g. ``"req_fs_1"``.
     :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
         ``"diff"``, ``"search"``.
-    :param workspace: Absolute path to the session's workspace on the
-        host, e.g. ``"/Users/alice/project"``.
+    :param workspace: Absolute path to the session's workspace, or a
+        ``managed://<repo>`` marker that the host resolves through its
+        active session lease.
     :param session_id: Session id, forwarded to the change registry.
     :param params: Operation-specific arguments (relative path, glob
         filters, pagination cursors), e.g.

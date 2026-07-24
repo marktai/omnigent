@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     HostModelOptionsFrame,
     encode_host_frame,
 )
+from omnigent.managed_workspace import managed_workspace
 from omnigent.onboarding.harness_install import ui_install_key, ui_installable_harnesses
 from omnigent.process_logging import env_truthy
 from omnigent.runner.identity import token_bound_runner_id
@@ -607,6 +608,7 @@ def create_hosts_router(
         # when the router was wired without an agent cache (non-prod
         # test wiring); create_app always supplies one.
         workspace = body.workspace
+        managed_repo: str | None = None
         if body.managed_repo is not None:
             if not body.managed_repo.strip():
                 raise HTTPException(status_code=400, detail="managed_repo must not be empty")
@@ -615,7 +617,8 @@ def create_hosts_router(
                     status_code=400,
                     detail="managed_repo launch requires git branch options",
                 )
-            workspace = f"managed://{body.managed_repo}"
+            managed_repo = body.managed_repo.strip()
+            workspace = managed_workspace(managed_repo)
         elif agent_store is not None and agent_cache is not None:
             from omnigent.server.routes._workspace_validation import (
                 WorkspaceValidationError,
@@ -792,7 +795,7 @@ def create_hosts_router(
                 binding_token=binding_token,
                 workspace=workspace,
                 git_branch=git_branch,
-                managed_repo=body.managed_repo,
+                managed_repo=managed_repo,
                 session_id=body.session_id,
                 harness=harness,
             )
@@ -822,7 +825,10 @@ def create_hosts_router(
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()
-            if result.get("error_code") == "managed_worktree_capacity":
+            if result.get("error_code") in {
+                "managed_worktree_capacity",
+                "managed_worktree_branch_conflict",
+            }:
                 raise HTTPException(
                     status_code=409,
                     detail=f"host failed to launch runner: {result.get('error')}",
@@ -839,17 +845,6 @@ def create_hosts_router(
             raise HTTPException(
                 status_code=502,
                 detail=f"host failed to launch runner: {result.get('error')}",
-            )
-
-        resolved_workspace = result.get("workspace")
-        resolved_git_branch = result.get("git_branch")
-        if body.managed_repo is not None and isinstance(resolved_workspace, str):
-            await asyncio.to_thread(
-                conversation_store.set_host_id,
-                body.session_id,
-                host_id,
-                resolved_workspace,
-                resolved_git_branch if isinstance(resolved_git_branch, str) else git_branch,
             )
 
         return {

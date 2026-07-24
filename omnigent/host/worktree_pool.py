@@ -86,6 +86,7 @@ class WorktreePoolManager:
         self._leases_by_path: dict[str, _Lease] = {}
         self._leases_by_id: dict[str, _Lease] = {}
         self._leases_by_session: dict[str, _Lease] = {}
+        self._leases_by_branch: dict[tuple[str, str], _Lease] = {}
         self._quarantined: set[str] = set()
         self._managed_pools: dict[str, ManagedWorktreeRepo] = {}
         self._managed_idle_eviction_seconds = 60 * 60
@@ -137,6 +138,14 @@ class WorktreePoolManager:
                 existing.idle_since = None
                 return _acquired(existing)
 
+            branch_key = (repo_id, branch_name)
+            branch_lease = self._leases_by_branch.get(branch_key)
+            if branch_lease is not None:
+                raise WorktreePoolError(
+                    f"managed branch {repo_id!r}/{branch_name!r} is already bound to "
+                    f"session {branch_lease.session_id!r}"
+                )
+
             repo = self._managed_pools.get(repo_id)
             if repo is None:
                 raise WorktreePoolError(f"host has no managed worktree repo {repo_id!r}")
@@ -164,6 +173,7 @@ class WorktreePoolManager:
                 self._leases_by_path[worktree_path] = lease
                 self._leases_by_id[lease.lease_id] = lease
                 self._leases_by_session[session_id] = lease
+                self._leases_by_branch[branch_key] = lease
                 return _acquired(lease)
             raise WorktreePoolError(
                 f"managed worktree repo {repo_id!r} has no available slots "
@@ -184,6 +194,12 @@ class WorktreePoolManager:
             lease = self._leases_by_session.get(session_id)
             if lease is not None:
                 self._release(lease)
+
+    def workspace_for_session(self, session_id: str) -> str | None:
+        """Return the physical worktree currently leased to a session."""
+        with self._lock:
+            lease = self._leases_by_session.get(session_id)
+            return lease.worktree_path if lease is not None else None
 
     def evict_idle_managed(self) -> list[str]:
         """Finalize and release sessions idle longer than the configured limit."""
@@ -214,6 +230,7 @@ class WorktreePoolManager:
         self._leases_by_id.pop(lease.lease_id, None)
         self._leases_by_path.pop(lease.worktree_path, None)
         self._leases_by_session.pop(lease.session_id, None)
+        self._leases_by_branch.pop((lease.pool_id, lease.branch), None)
         self._quarantined.discard(lease.worktree_path)
 
     def _checkout_session_branch(
