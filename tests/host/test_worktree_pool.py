@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import call, patch
@@ -39,16 +40,20 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout
 
 
+def _create_git_repo(path: Path) -> Path:
+    path.mkdir(parents=True)
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.email", "pool-test@example.com")
+    _git(path, "config", "user.name", "Pool Test")
+    (path / "README.md").write_text("hi")
+    _git(path, "add", ".")
+    _git(path, "commit", "-q", "-m", "init")
+    return path
+
+
 @pytest.fixture()
 def git_repo(tmp_path: Path) -> Iterator[Path]:
-    repo = (tmp_path / "repo").resolve()
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "pool-test@example.com")
-    _git(repo, "config", "user.name", "Pool Test")
-    (repo / "README.md").write_text("hi")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "init")
+    repo = _create_git_repo((tmp_path / "repo").resolve())
     yield repo
 
 
@@ -211,6 +216,38 @@ def test_managed_pool_idle_eviction_pushes_and_reuses_slot(git_repo: Path) -> No
     assert _git_bare(remote, "show", "refs/heads/feature/one:result.txt") == "done\n"
 
 
+def test_managed_pool_resume_can_move_after_eviction(git_repo: Path) -> None:
+    _add_origin(git_repo)
+    paths = _precreate_worktrees(git_repo, 2)
+    manager = WorktreePoolManager()
+    manager.adopt_managed_config(_managed_config(git_repo, paths, idle=0))
+    first = manager.acquire_managed(
+        repo_id="universe",
+        branch_name="feature/resumable",
+        session_id="session-resumable",
+        runner_id="runner-resumable",
+    )
+    manager.mark_runner_idle("runner-resumable")
+
+    assert manager.evict_idle_managed() == ["session-resumable"]
+    occupying = manager.acquire_managed(
+        repo_id="universe",
+        branch_name="feature/occupying",
+        session_id="session-occupying",
+        runner_id="runner-occupying",
+    )
+    resumed = manager.acquire_managed(
+        repo_id="universe",
+        branch_name="feature/resumable",
+        session_id="session-resumable",
+        runner_id="runner-resumed",
+    )
+
+    assert occupying.worktree_path == first.worktree_path
+    assert resumed.worktree_path != first.worktree_path
+    assert resumed.branch == first.branch
+
+
 def test_managed_pool_idle_eviction_pushes_clean_unpushed_commit(git_repo: Path) -> None:
     remote = _add_origin(git_repo)
     paths = _precreate_worktrees(git_repo, 1)
@@ -235,6 +272,114 @@ def test_managed_pool_idle_eviction_pushes_clean_unpushed_commit(git_repo: Path)
         _git_bare(remote, "show", "refs/heads/feature/clean-commit:committed.txt")
         == "committed before eviction\n"
     )
+
+
+def test_managed_pool_eviction_isolates_release_failures(git_repo: Path) -> None:
+    _add_origin(git_repo)
+    paths = _precreate_worktrees(git_repo, 2)
+    manager = WorktreePoolManager()
+    manager.adopt_managed_config(_managed_config(git_repo, paths, idle=0))
+    first = manager.acquire_managed(
+        repo_id="universe",
+        branch_name="feature/blocked-release",
+        session_id="session-blocked",
+        runner_id="runner-blocked",
+    )
+    second = manager.acquire_managed(
+        repo_id="universe",
+        branch_name="feature/releasable",
+        session_id="session-releasable",
+        runner_id="runner-releasable",
+    )
+    manager.mark_runner_idle("runner-blocked")
+    manager.mark_runner_idle("runner-releasable")
+    original_release = manager._release
+
+    def release(lease: worktree_pool._Lease) -> None:
+        if lease.session_id == "session-blocked":
+            raise WorktreePoolError("simulated push failure")
+        original_release(lease)
+
+    with patch.object(manager, "_release", side_effect=release):
+        assert manager.evict_idle_managed() == ["session-releasable"]
+        replacement = manager.acquire_managed(
+            repo_id="universe",
+            branch_name="feature/replacement",
+            session_id="session-replacement",
+            runner_id="runner-replacement",
+        )
+
+    assert manager.workspace_for_session("session-blocked") == first.worktree_path
+    assert replacement.worktree_path == second.worktree_path
+
+
+def test_managed_pool_git_operations_are_locked_per_repository(tmp_path: Path) -> None:
+    repo_a = _create_git_repo((tmp_path / "a" / "repo").resolve())
+    repo_b = _create_git_repo((tmp_path / "b" / "repo").resolve())
+    _add_origin(repo_a)
+    _add_origin(repo_b)
+    paths_a = _precreate_worktrees(repo_a, 1)
+    paths_b = _precreate_worktrees(repo_b, 1)
+    manager = WorktreePoolManager()
+    manager.adopt_managed_config(
+        ManagedWorktreeConfig(
+            repos=(
+                _managed_config(repo_a, paths_a).repos[0],
+                ManagedWorktreeRepo(
+                    repo_id="runtime",
+                    repo_root=str(repo_b),
+                    base_branch="main",
+                    branch_remote="origin",
+                    worktrees=tuple(str(path) for path in paths_b),
+                ),
+            )
+        )
+    )
+    first_restore_started = threading.Event()
+    release_first_restore = threading.Event()
+    second_acquired = threading.Event()
+    errors: list[BaseException] = []
+    original_restore = manager._restore_slot
+
+    def restore(repo_root: str, base_branch: str, slot_path: Path) -> None:
+        if repo_root == str(repo_a):
+            first_restore_started.set()
+            if not release_first_restore.wait(timeout=5):
+                raise AssertionError("timed out waiting to release first repository")
+        original_restore(repo_root, base_branch, slot_path)
+
+    def acquire(repo_id: str, branch: str, session: str, done: threading.Event) -> None:
+        try:
+            manager.acquire_managed(
+                repo_id=repo_id,
+                branch_name=branch,
+                session_id=session,
+                runner_id=f"runner-{session}",
+            )
+            done.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    with patch.object(manager, "_restore_slot", side_effect=restore):
+        first_thread = threading.Thread(
+            target=acquire,
+            args=("universe", "feature/a", "a", threading.Event()),
+        )
+        first_thread.start()
+        assert first_restore_started.wait(timeout=2)
+        second_thread = threading.Thread(
+            target=acquire,
+            args=("runtime", "feature/b", "b", second_acquired),
+        )
+        second_thread.start()
+        assert second_acquired.wait(timeout=2), "repository B was blocked by repository A"
+        release_first_restore.set()
+        first_thread.join(timeout=5)
+        second_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
 
 
 def test_refresh_managed_bases_updates_remote_tracking_ref(git_repo: Path) -> None:

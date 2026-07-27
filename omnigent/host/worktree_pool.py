@@ -109,8 +109,11 @@ class WorktreePoolManager:
         self._leases_by_id: dict[str, _Lease] = {}
         self._leases_by_session: dict[str, _Lease] = {}
         self._leases_by_branch: dict[tuple[str, str], _Lease] = {}
+        self._preparing_sessions: set[str] = set()
+        self._preparing_paths: set[str] = set()
         self._quarantined: set[str] = set()
         self._managed_pools: dict[str, ManagedWorktreeRepo] = {}
+        self._repo_locks: dict[str, threading.RLock] = {}
         self._managed_idle_eviction_seconds = 60 * 60
 
     def adopt_managed_config(self, config: ManagedWorktreeConfig) -> None:
@@ -136,6 +139,7 @@ class WorktreePoolManager:
                             f"managed worktree {path} does not belong to {repo.repo_root}"
                         )
                 self._managed_pools[repo.repo_id] = repo
+                self._repo_locks[repo.repo_id] = threading.RLock()
 
     def acquire_managed(
         self,
@@ -148,55 +152,78 @@ class WorktreePoolManager:
         """Start or resume a session in one of the host's worktrees."""
         validate_branch_name(branch_name)
         with self._lock:
-            self.evict_idle_managed()
-            existing = self._leases_by_session.get(session_id)
-            if existing is not None:
-                if existing.pool_id != repo_id or existing.branch != branch_name:
-                    raise WorktreePoolError(
-                        f"session {session_id!r} is already bound to "
-                        f"{existing.pool_id!r}/{existing.branch!r}"
-                    )
-                existing.runner_id = runner_id
-                existing.idle_since = None
-                return _acquired(existing)
-
-            branch_key = (repo_id, branch_name)
-            branch_lease = self._leases_by_branch.get(branch_key)
-            if branch_lease is not None:
-                raise WorktreePoolError(
-                    f"managed branch {repo_id!r}/{branch_name!r} is already bound to "
-                    f"session {branch_lease.session_id!r}"
-                )
-
             repo = self._managed_pools.get(repo_id)
             if repo is None:
                 raise WorktreePoolError(f"host has no managed worktree repo {repo_id!r}")
-            for index, worktree_path in enumerate(repo.worktrees, start=1):
-                if worktree_path in self._leases_by_path or worktree_path in self._quarantined:
-                    continue
-                try:
-                    self._restore_slot(repo.repo_root, repo.base_branch, Path(worktree_path))
-                    self._checkout_session_branch(repo, worktree_path, branch_name)
-                except WorktreeError:
-                    self._quarantined.add(worktree_path)
-                    continue
-                lease = _Lease(
-                    lease_id=f"lease_{secrets.token_hex(16)}",
-                    pool_id=repo_id,
-                    slot_id=f"slot-{index}",
-                    repo_root=repo.repo_root,
-                    worktree_path=worktree_path,
-                    base_branch=repo.base_branch,
-                    branch_remote=repo.branch_remote,
-                    branch=branch_name,
-                    session_id=session_id,
-                    runner_id=runner_id,
-                )
-                self._leases_by_path[worktree_path] = lease
-                self._leases_by_id[lease.lease_id] = lease
-                self._leases_by_session[session_id] = lease
-                self._leases_by_branch[branch_key] = lease
-                return _acquired(lease)
+            repo_lock = self._repo_locks[repo_id]
+
+        with repo_lock:
+            self._evict_idle_repo(repo_id)
+            branch_key = (repo_id, branch_name)
+            with self._lock:
+                existing = self._leases_by_session.get(session_id)
+                if existing is not None:
+                    if existing.pool_id != repo_id or existing.branch != branch_name:
+                        raise WorktreePoolError(
+                            f"session {session_id!r} is already bound to "
+                            f"{existing.pool_id!r}/{existing.branch!r}"
+                        )
+                    existing.runner_id = runner_id
+                    existing.idle_since = None
+                    return _acquired(existing)
+                if session_id in self._preparing_sessions:
+                    raise WorktreePoolError(f"session {session_id!r} is already being prepared")
+                branch_lease = self._leases_by_branch.get(branch_key)
+                if branch_lease is not None:
+                    raise WorktreePoolError(
+                        f"managed branch {repo_id!r}/{branch_name!r} is already bound to "
+                        f"session {branch_lease.session_id!r}"
+                    )
+                self._preparing_sessions.add(session_id)
+
+            try:
+                for index, worktree_path in enumerate(repo.worktrees, start=1):
+                    with self._lock:
+                        if (
+                            worktree_path in self._leases_by_path
+                            or worktree_path in self._preparing_paths
+                            or worktree_path in self._quarantined
+                        ):
+                            continue
+                        self._preparing_paths.add(worktree_path)
+                    try:
+                        self._restore_slot(repo.repo_root, repo.base_branch, Path(worktree_path))
+                        self._checkout_session_branch(repo, worktree_path, branch_name)
+                    except WorktreeError:
+                        with self._lock:
+                            self._quarantined.add(worktree_path)
+                        continue
+                    finally:
+                        with self._lock:
+                            self._preparing_paths.discard(worktree_path)
+
+                    lease = _Lease(
+                        lease_id=f"lease_{secrets.token_hex(16)}",
+                        pool_id=repo_id,
+                        slot_id=f"slot-{index}",
+                        repo_root=repo.repo_root,
+                        worktree_path=worktree_path,
+                        base_branch=repo.base_branch,
+                        branch_remote=repo.branch_remote,
+                        branch=branch_name,
+                        session_id=session_id,
+                        runner_id=runner_id,
+                    )
+                    with self._lock:
+                        self._leases_by_path[worktree_path] = lease
+                        self._leases_by_id[lease.lease_id] = lease
+                        self._leases_by_session[session_id] = lease
+                        self._leases_by_branch[branch_key] = lease
+                    return _acquired(lease)
+            finally:
+                with self._lock:
+                    self._preparing_sessions.discard(session_id)
+
             raise WorktreePoolError(
                 f"managed worktree repo {repo_id!r} has no available slots "
                 f"(capacity={len(repo.worktrees)})"
@@ -214,8 +241,14 @@ class WorktreePoolManager:
         """Return a session's slot immediately when its runner never starts."""
         with self._lock:
             lease = self._leases_by_session.get(session_id)
-            if lease is not None:
-                self._release(lease)
+            repo_lock = self._repo_locks.get(lease.pool_id) if lease is not None else None
+        if lease is None or repo_lock is None:
+            return
+        with repo_lock:
+            with self._lock:
+                if self._leases_by_session.get(session_id) is not lease:
+                    return
+            self._release(lease)
 
     def workspace_for_session(self, session_id: str) -> str | None:
         """Return the physical worktree currently leased to a session."""
@@ -228,7 +261,11 @@ class WorktreePoolManager:
         refreshed: dict[str, str] = {}
         failures: list[str] = []
         with self._lock:
-            for repo in self._managed_pools.values():
+            repos = [
+                (repo, self._repo_locks[repo.repo_id]) for repo in self._managed_pools.values()
+            ]
+        for repo, repo_lock in repos:
+            with repo_lock:
                 remote_branch = _remote_tracking_branch(repo.repo_root, repo.base_branch)
                 if remote_branch is None:
                     continue
@@ -252,18 +289,37 @@ class WorktreePoolManager:
     def evict_idle_managed(self) -> list[str]:
         """Finalize and release sessions idle longer than the configured limit."""
         with self._lock:
-            now = time.monotonic()
+            repos = [(repo_id, self._repo_locks[repo_id]) for repo_id in self._managed_pools]
+        released: list[str] = []
+        for repo_id, repo_lock in repos:
+            with repo_lock:
+                released.extend(self._evict_idle_repo(repo_id))
+        return released
+
+    def _evict_idle_repo(self, repo_id: str) -> list[str]:
+        now = time.monotonic()
+        with self._lock:
             expired = [
                 lease
                 for lease in self._leases_by_id.values()
-                if lease.idle_since is not None
+                if lease.pool_id == repo_id
+                and lease.idle_since is not None
                 and now - lease.idle_since >= self._managed_idle_eviction_seconds
             ]
-            released: list[str] = []
-            for lease in expired:
+        released: list[str] = []
+        for lease in expired:
+            try:
                 self._release(lease)
-                released.append(lease.session_id)
-            return released
+            except WorktreePoolError:
+                _logger.exception(
+                    "managed worktree release failed for repository %s session %s slot %s",
+                    repo_id,
+                    lease.session_id,
+                    lease.slot_id,
+                )
+                continue
+            released.append(lease.session_id)
+        return released
 
     def _release(self, lease: _Lease) -> None:
         try:
@@ -273,13 +329,15 @@ class WorktreePoolManager:
             if result.returncode != 0:
                 raise _git_error("git branch -D failed", result)
         except WorktreeError as exc:
-            self._quarantined.add(lease.worktree_path)
+            with self._lock:
+                self._quarantined.add(lease.worktree_path)
             raise WorktreePoolError(exc.message) from exc
-        self._leases_by_id.pop(lease.lease_id, None)
-        self._leases_by_path.pop(lease.worktree_path, None)
-        self._leases_by_session.pop(lease.session_id, None)
-        self._leases_by_branch.pop((lease.pool_id, lease.branch), None)
-        self._quarantined.discard(lease.worktree_path)
+        with self._lock:
+            self._leases_by_id.pop(lease.lease_id, None)
+            self._leases_by_path.pop(lease.worktree_path, None)
+            self._leases_by_session.pop(lease.session_id, None)
+            self._leases_by_branch.pop((lease.pool_id, lease.branch), None)
+            self._quarantined.discard(lease.worktree_path)
 
     def _checkout_session_branch(
         self,

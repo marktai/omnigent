@@ -18,7 +18,8 @@ only orchestrates sessions and runners.
 
 - Cap concurrent managed sessions at the number of configured worktrees.
 - Reuse worktrees without creating or deleting them at runtime.
-- Keep a session on the same worktree across runner restarts.
+- Keep a session on the same worktree across runner restarts while its retained
+  lease remains active.
 - Resume a pushed session branch when a session gets a new worktree.
 - Commit dirty work and push the session branch before destructive cleanup.
 - Reset released worktrees to a known detached base state.
@@ -36,8 +37,10 @@ only orchestrates sessions and runners.
 
 ## Host configuration
 
-The host reads managed worktree settings from its local `config.yaml` at
-startup:
+The operator writes managed worktree settings into the host's local
+`config.yaml` before startup. The host identity initializer preserves existing
+keys under `host`, so it can safely add `host_id` and `name` when the managed
+worktree block was written before the host's first connection:
 
 ```yaml
 host:
@@ -70,11 +73,12 @@ At startup and every hour plus a stable per-host jitter of up to five minutes,
 the host refreshes configured
 remote-tracking base refs such as `mirror/master` with an explicit fetch into
 `refs/remotes/mirror/master`. Refresh runs in the background and uses the same
-pool lock as assignment and cleanup, so a new session cannot prepare a branch
-from the ref while it is being updated. Local-only base refs such as `main`
-remain valid but are not updated by this background job. Managed fetches and
-pushes retry transient ref-lock and transport failures three times with bounded
-exponential backoff.
+per-repository operation lock as assignment and cleanup, so a new session for
+that repository cannot prepare a branch from the ref while it is being updated.
+Other configured repositories continue independently. Local-only base refs such
+as `main` remain valid but are not updated by this background job. Managed
+fetches and pushes retry transient ref-lock and transport failures three times
+with bounded exponential backoff.
 
 The operator creates these worktrees before starting the host. For example:
 
@@ -83,6 +87,10 @@ git -C ~/universe worktree add --detach ~/universe-omnigent-1 mirror/master
 git -C ~/universe worktree add --detach ~/universe-omnigent-2 mirror/master
 omnigent host
 ```
+
+The worktree paths must also be added to `host.managed_worktrees.repos` in the
+same local configuration file. Creating directories alone does not register a
+pool with the host.
 
 ## Server request
 
@@ -170,9 +178,9 @@ explicit stop request, or host shutdown, the host marks the session's worktree
 idle. It does not reset or release the worktree at that point.
 
 A resume request with the same `session_id`, repository ID, and branch reuses
-the same worktree and clears its idle timestamp. A request that tries to change
-the repository or branch for an existing session fails instead of mutating the
-assignment.
+the same worktree and clears its idle timestamp while the retained lease still
+exists. A request that tries to change the repository or branch for an existing
+session fails instead of mutating the assignment.
 
 The server continues to own runner connection state. A disconnected runner can
 be relaunched, but the server does not decide which worktree to use.
@@ -180,7 +188,9 @@ be relaunched, but the server does not decide which worktree to use.
 The session has no durable affinity to a physical worktree. Its durable identity
 is the repository alias plus branch. A physical slot is only retained while the
 runner is active or during the idle-retention window. After eviction, the host
-may resume the branch in any available configured slot.
+may resume the branch in any available configured slot. In other words, the
+implementation provides retention-window affinity, not durable session-to-slot
+affinity.
 
 ## Idle eviction
 
@@ -212,7 +222,17 @@ newer binding.
 
 If commit, push, reset, or cleanup fails, the host keeps the assignment and
 quarantines the worktree. It does not notify the server or hand the directory to
-another session. This favors preserving work over recovering capacity.
+another session. Failure is isolated to that lease: the sweep continues with
+other expired leases, and unrelated repositories and healthy slots remain
+available. This favors preserving work over recovering capacity.
+
+Managed mode currently uses Git as its recovery checkpoint and always pushes
+before destructive cleanup. Operators should enable it only for repositories
+and branch remotes where agent-produced commits, including potentially
+sensitive generated files, are permitted to leave the host. There is no
+per-session opt-out or redaction step in this initial implementation. A future
+checkpoint provider can replace mandatory remote pushes without changing the
+host-owned lease lifecycle.
 
 ## Failed launch
 
@@ -271,10 +291,13 @@ Unit tests cover:
 - configuration parsing and validation;
 - adoption of existing worktrees without creating new ones;
 - fixed-capacity rejection;
-- session affinity across runner restarts;
+- retention-window session affinity across runner restarts;
+- loss of physical worktree affinity after eviction;
 - branch creation and remote branch resume;
 - startup and hourly refresh of remote-tracking base refs;
 - dirty-work commit and clean-or-dirty branch push before cleanup;
+- isolation of one failed release from other leases and acquisitions;
+- concurrent Git operations for independently configured repositories;
 - hard reset, `clean -ffd`, detached-base restore, and slot reuse;
 - frame round trips for launch intent, resolved workspace, branch, and release
   notification;
