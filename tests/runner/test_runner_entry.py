@@ -21,6 +21,7 @@ from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
     _agent_cache_dest,
+    _apply_reaper_env_for_idle_timeout,
     _InitialAuthTokenFactory,
     _install_crash_logging,
     _load_runner_idle_timeout_s_from_config,
@@ -46,6 +47,13 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runner_lifetime import (
+    HARNESS_IDLE_TIMEOUT_ENV_VAR,
+    PANE_IDLE_TIMEOUT_ENV_VAR,
+    RUNNER_IDLE_TIMEOUT_ENV_VAR,
+)
+from omnigent.runtime.harnesses.process_manager import _resolve_harness_idle_timeout_s
+from omnigent.terminals.pane_reaper import resolve_native_pane_idle_timeout_s
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -1146,6 +1154,7 @@ def test_load_runner_idle_timeout_defaults_when_config_missing(
     :returns: None.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv(RUNNER_IDLE_TIMEOUT_ENV_VAR, raising=False)
 
     assert _load_runner_idle_timeout_s_from_config() == float(_DEFAULT_RUNNER_IDLE_TIMEOUT_S)
 
@@ -1161,6 +1170,7 @@ def test_load_runner_idle_timeout_reads_nested_runner_config(
     :returns: None.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv(RUNNER_IDLE_TIMEOUT_ENV_VAR, raising=False)
     (tmp_path / "config.yaml").write_text(
         "runner:\n  idle_timeout_s: 12.5\n",
         encoding="utf-8",
@@ -1180,6 +1190,7 @@ def test_load_runner_idle_timeout_zero_disables_watchdog(
     :returns: None.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv(RUNNER_IDLE_TIMEOUT_ENV_VAR, raising=False)
     (tmp_path / "config.yaml").write_text(
         "runner:\n  idle_timeout_s: 0\n",
         encoding="utf-8",
@@ -1210,10 +1221,120 @@ def test_load_runner_idle_timeout_rejects_invalid_values(
     :returns: None.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv(RUNNER_IDLE_TIMEOUT_ENV_VAR, raising=False)
     (tmp_path / "config.yaml").write_text(config_text, encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="runner"):
         _load_runner_idle_timeout_s_from_config()
+
+
+def test_load_runner_idle_timeout_accepts_duration_and_never(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``runner.idle_timeout_s`` takes a duration or ``never``.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param tmp_path: Isolated config home.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv(RUNNER_IDLE_TIMEOUT_ENV_VAR, raising=False)
+    config_path = tmp_path / "config.yaml"
+
+    config_path.write_text("runner:\n  idle_timeout_s: 30m\n", encoding="utf-8")
+    assert _load_runner_idle_timeout_s_from_config() == 1800.0
+
+    config_path.write_text("runner:\n  idle_timeout_s: never\n", encoding="utf-8")
+    assert _load_runner_idle_timeout_s_from_config() == 0.0
+
+
+def test_load_runner_idle_timeout_env_overrides_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The env knob wins so one launch can opt out without editing config.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param tmp_path: Isolated config home.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("runner:\n  idle_timeout_s: 2h\n", encoding="utf-8")
+    monkeypatch.setenv(RUNNER_IDLE_TIMEOUT_ENV_VAR, "never")
+
+    assert _load_runner_idle_timeout_s_from_config() == 0.0
+
+
+def test_load_runner_idle_timeout_rejects_invalid_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A typo'd env override fails loud rather than silently defaulting.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param tmp_path: Isolated config home.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv(RUNNER_IDLE_TIMEOUT_ENV_VAR, "soon")
+
+    with pytest.raises(RuntimeError, match=RUNNER_IDLE_TIMEOUT_ENV_VAR):
+        _load_runner_idle_timeout_s_from_config()
+
+
+def test_disabled_idle_timeout_disables_both_reapers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabling autotermination also stops the harness and pane reapers.
+
+    A runner told never to autoterminate would otherwise still lose its harness
+    subprocess and native TUI pane to their own one-hour windows.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv(HARNESS_IDLE_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.delenv(PANE_IDLE_TIMEOUT_ENV_VAR, raising=False)
+
+    _apply_reaper_env_for_idle_timeout(0.0)
+
+    assert _resolve_harness_idle_timeout_s() == 0.0
+    assert resolve_native_pane_idle_timeout_s() == 0.0
+
+
+def test_positive_idle_timeout_leaves_reapers_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finite runner window leaves the reapers on their own defaults.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv(HARNESS_IDLE_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.delenv(PANE_IDLE_TIMEOUT_ENV_VAR, raising=False)
+
+    _apply_reaper_env_for_idle_timeout(1800.0)
+
+    assert HARNESS_IDLE_TIMEOUT_ENV_VAR not in os.environ
+    assert PANE_IDLE_TIMEOUT_ENV_VAR not in os.environ
+
+
+def test_explicit_reaper_env_survives_disabled_runner_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator's explicit reaper window still wins over the fold-in.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv(HARNESS_IDLE_TIMEOUT_ENV_VAR, "600")
+    monkeypatch.delenv(PANE_IDLE_TIMEOUT_ENV_VAR, raising=False)
+
+    _apply_reaper_env_for_idle_timeout(0.0)
+
+    assert _resolve_harness_idle_timeout_s() == 600.0
+    assert resolve_native_pane_idle_timeout_s() == 0.0
 
 
 def test_runner_threadpool_defaults_when_config_missing(

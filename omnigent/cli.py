@@ -69,6 +69,11 @@ from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
 from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
+from omnigent.runner_lifetime import (
+    RUNNER_IDLE_TIMEOUT_CONFIG_KEY,
+    format_idle_timeout,
+    parse_idle_timeout,
+)
 
 if TYPE_CHECKING:
     import socket
@@ -419,9 +424,15 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "opencode_model",
         "server",
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
+        # How long a runner may sit idle before it autoterminates; ``never``
+        # keeps it up until it's stopped, matching a vendor TUI's lifetime.
+        RUNNER_IDLE_TIMEOUT_CONFIG_KEY,
     }
 )
 _BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset({_AUTO_OPEN_CONVERSATION_CONFIG_KEY})
+# Keys stored as a nested block in config.yaml but addressed by their dotted
+# path on the command line (``config set runner.idle_timeout_s=never``).
+_DOTTED_CONFIG_KEYS: frozenset[str] = frozenset({RUNNER_IDLE_TIMEOUT_CONFIG_KEY})
 _CONFIG_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 _CONFIG_FALSE_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
 _ConfigValue: TypeAlias = (
@@ -897,6 +908,29 @@ def _normalize_harness_scalar_on_write(
     return True
 
 
+def _deep_merge_config_block(
+    existing: object,
+    incoming: Mapping[str, object],
+) -> dict[str, object]:
+    """Merge one level of a nested config block, dropping ``None`` fields.
+
+    A ``None`` value means "remove this field" (how ``config unset`` addresses
+    a single field of a block like ``runner:``), so it is stripped rather than
+    written as a YAML null the readers would then have to special-case.
+
+    :param existing: The current value of the block, if any.
+    :param incoming: Fields to set, with ``None`` marking removals.
+    :returns: The merged block.
+    """
+    merged: dict[str, object] = dict(existing) if isinstance(existing, Mapping) else {}
+    for field, value in incoming.items():
+        if value is None:
+            merged.pop(field, None)
+        else:
+            merged[field] = value
+    return merged
+
+
 def _save_global_config(  # type: ignore[explicit-any]
     # Any (matching the yaml-boundary helpers above): config values are
     # heterogeneous YAML scalars and nested mappings — e.g. the providers:
@@ -941,10 +975,13 @@ def _save_global_config(  # type: ignore[explicit-any]
     cfg = _load_global_config()
     for key, value in settings.items():
         if key in deep_merge_keys and isinstance(value, Mapping):
-            existing = cfg.get(key)
-            merged = dict(existing) if isinstance(existing, Mapping) else {}
-            merged.update(value)
-            cfg[key] = merged
+            merged = _deep_merge_config_block(cfg.get(key), value)
+            # Unsetting a block's last field drops the block, so the file
+            # doesn't accumulate empty `runner: {}` stanzas.
+            if merged:
+                cfg[key] = merged
+            else:
+                cfg.pop(key, None)
         else:
             cfg[key] = value
     for key in unset_keys:
@@ -1030,10 +1067,13 @@ def _save_local_config(
     cfg = _load_local_config()
     for key, value in settings.items():
         if key in deep_merge_keys and isinstance(value, Mapping):
-            existing = cfg.get(key)
-            merged = dict(existing) if isinstance(existing, Mapping) else {}
-            merged.update(value)
-            cfg[key] = merged
+            merged = _deep_merge_config_block(cfg.get(key), value)
+            # Unsetting a block's last field drops the block, so the file
+            # doesn't accumulate empty `runner: {}` stanzas.
+            if merged:
+                cfg[key] = merged
+            else:
+                cfg.pop(key, None)
         else:
             cfg[key] = value
     for key in unset_keys:
@@ -8431,9 +8471,65 @@ def _parse_config_settings(
             value = str(Path(value).resolve())
         if key in _BOOLEAN_CONFIG_KEYS:
             parsed[key] = _parse_config_bool(key, value)
+        elif key == RUNNER_IDLE_TIMEOUT_CONFIG_KEY:
+            parsed[key] = _parse_runner_idle_timeout_setting(value)
         else:
             parsed[key] = value
     return parsed
+
+
+def _parse_runner_idle_timeout_setting(value: str) -> int | float:
+    """Validate a ``runner.idle_timeout_s=<value>`` setting.
+
+    Accepts bare seconds, a duration (``30m``, ``2h``), or ``0``/``never`` to
+    turn autotermination off. Validating here means a typo is rejected by the
+    CLI rather than failing the next runner at boot. Whole windows are stored as
+    ints so ``2h`` lands in config.yaml as ``7200``, not ``7200.0``.
+
+    :param value: The raw right-hand side, e.g. ``"2h"``.
+    :returns: The window in seconds, e.g. ``7200``.
+    :raises click.ClickException: If *value* is not a valid window.
+    """
+    try:
+        seconds = parse_idle_timeout(value, label=RUNNER_IDLE_TIMEOUT_CONFIG_KEY)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return int(seconds) if seconds.is_integer() else seconds
+
+
+def _expand_dotted_config_keys(
+    parsed: dict[str, object],
+    unset_keys: tuple[str, ...],
+) -> tuple[dict[str, object], tuple[str, ...], tuple[str, ...]]:
+    """Fold dotted keys into the nested blocks config.yaml actually stores.
+
+    ``runner.idle_timeout_s`` is one field of a ``runner:`` block that also
+    holds ``threadpool_max_workers``, so it is written as a one-level
+    deep-merge and unset by dropping just that field — never the whole block.
+
+    :param parsed: Validated ``KEY=VALUE`` mapping, possibly holding dotted keys.
+    :param unset_keys: Keys being removed, possibly dotted.
+    :returns: ``(settings, unset, deep_merge_keys)`` ready for the save
+        functions, with dotted keys rewritten to nested mappings.
+    """
+    settings = {k: v for k, v in parsed.items() if k not in _DOTTED_CONFIG_KEYS}
+    plain_unset = tuple(k for k in unset_keys if k not in _DOTTED_CONFIG_KEYS)
+    deep_merge: list[str] = []
+    # Group by block so two dotted keys in the same block merge into one entry
+    # instead of the second overwriting the first.
+    blocks: dict[str, dict[str, object]] = {}
+    for dotted in _DOTTED_CONFIG_KEYS:
+        section, _, field = dotted.partition(".")
+        if dotted in parsed:
+            blocks.setdefault(section, {})[field] = parsed[dotted]
+        if dotted in unset_keys:
+            # Unset is expressed as an explicit ``None``; the save helpers strip
+            # it below so the field disappears rather than becoming null.
+            blocks.setdefault(section, {})[field] = None
+    for section, fields in blocks.items():
+        settings[section] = fields
+        deep_merge.append(section)
+    return settings, plain_unset, tuple(deep_merge)
 
 
 def _harness_deep_merge_keys(
@@ -8542,8 +8638,47 @@ def _print_config_default_rows(
             click.echo(f"  harness={default}")
             if overrides:
                 click.echo(f"    # per-harness overrides: {', '.join(sorted(overrides))}")
+        elif k == RUNNER_IDLE_TIMEOUT_CONFIG_KEY:
+            click.echo(f"  {k}={_format_runner_idle_timeout_for_display(v)}")
         else:
             click.echo(f"  {k}={v}")
+
+
+def _format_runner_idle_timeout_for_display(value: object) -> str:
+    """Render ``runner.idle_timeout_s`` for ``config list``.
+
+    :param value: The raw configured value, e.g. ``7200`` or ``"never"``.
+    :returns: A compact duration (``"2h"``) or ``"never"`` when
+        autotermination is off; the raw value when it can't be parsed (so a
+        malformed config is visible here rather than silently prettified).
+    """
+    try:
+        return format_idle_timeout(parse_idle_timeout(value, label=RUNNER_IDLE_TIMEOUT_CONFIG_KEY))
+    except ValueError:
+        return str(value)
+
+
+def _config_defaults_for_display(
+    cfg: Mapping[str, object],
+) -> dict[str, object]:
+    """Filter a raw config to the keys ``config list`` shows.
+
+    Top-level keys are taken as-is; dotted keys (``runner.idle_timeout_s``) are
+    lifted out of their nested block so they display under the same spelling
+    ``config set`` accepts. Internal blocks (``providers``, ``host``, ``tui``)
+    and other fields of a partially-shown block (``runner.threadpool_max_workers``)
+    are left out.
+
+    :param cfg: A raw loaded config mapping.
+    :returns: The displayable subset, keyed as the user spells it.
+    """
+    shown: dict[str, object] = {k: v for k, v in cfg.items() if k in _GLOBAL_CONFIG_KEYS}
+    for dotted in _DOTTED_CONFIG_KEYS:
+        section, _, field = dotted.partition(".")
+        block = cfg.get(section)
+        if isinstance(block, Mapping) and field in block:
+            shown[dotted] = block[field]
+    return shown
 
 
 def _print_config_defaults() -> None:
@@ -8558,8 +8693,8 @@ def _print_config_defaults() -> None:
     # Only the user-facing run defaults (the keys ``config set`` accepts).
     # Internal blocks (``providers``, ``host``, ``tui``) are omitted — the
     # ``providers`` block is shown in the credentials-by-harness section.
-    global_cfg = {k: v for k, v in _load_global_config().items() if k in _GLOBAL_CONFIG_KEYS}
-    local_cfg = {k: v for k, v in _load_local_config().items() if k in _GLOBAL_CONFIG_KEYS}
+    global_cfg = _config_defaults_for_display(_load_global_config())
+    local_cfg = _config_defaults_for_display(_load_local_config())
     if not global_cfg and not local_cfg:
         click.echo(
             "  (none set — `omnigent config set key=value` for project,\n"
@@ -8878,7 +9013,11 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     ``~/.gitconfig``). Project values take precedence.
 
     Supported keys: auto_open_conversation, default_agent, harness,
-    model, server.
+    model, runner.idle_timeout_s, server.
+
+    ``runner.idle_timeout_s`` is how long a runner may sit idle before it
+    autoterminates — seconds, a duration (``30m``, ``2h``), or ``never`` to
+    keep sessions up until you stop them, like a vendor TUI.
 
     :param is_global: When ``True``, write to ``~/.omnigent/config.yaml``;
         when ``False``, to ``.omnigent/config.yaml`` in cwd.
@@ -8889,16 +9028,16 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     Examples:
       omnigent config set default_agent=examples/hello_world.yaml
       omnigent config set --global server=https://<app>.databricksapps.com
+      omnigent config set --global runner.idle_timeout_s=never
     """
+    parsed = _parse_config_settings(settings, resolve_paths=is_global)
+    deep_keys = _harness_deep_merge_keys(parsed)
+    to_write, _, dotted_deep_keys = _expand_dotted_config_keys(parsed, ())
     if is_global:
-        parsed = _parse_config_settings(settings, resolve_paths=True)
-        deep_keys = _harness_deep_merge_keys(parsed)
-        _save_global_config(parsed, (), deep_keys)
+        _save_global_config(to_write, (), (*deep_keys, *dotted_deep_keys))
         config_path: Path = _effective_global_config_path()
     else:
-        parsed = _parse_config_settings(settings, resolve_paths=False)
-        deep_keys = _harness_deep_merge_keys(parsed)
-        _save_local_config(parsed, (), deep_keys)
+        _save_local_config(to_write, (), (*deep_keys, *dotted_deep_keys))
         config_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
     click.echo(f"Set {len(parsed)} key(s) in {config_path}")
 
@@ -8920,11 +9059,12 @@ def config_unset(is_global: bool, keys: tuple[str, ...]) -> None:
     :param keys: Keys to remove, e.g. ``("server", "model")``.
     """
     validated = _validate_unset_keys(keys)
+    to_write, plain_unset, dotted_deep_keys = _expand_dotted_config_keys({}, tuple(validated))
     if is_global:
-        _save_global_config({}, tuple(validated))
+        _save_global_config(to_write, plain_unset, dotted_deep_keys)
         config_path: Path = _effective_global_config_path()
     else:
-        _save_local_config({}, tuple(validated))
+        _save_local_config(to_write, plain_unset, dotted_deep_keys)
         config_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
     click.echo(f"Unset {len(validated)} key(s) from {config_path}")
 

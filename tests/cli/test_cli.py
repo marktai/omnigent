@@ -4514,6 +4514,197 @@ def test_config_set_local_writes_project_config(
 
 
 # ---------------------------------------------------------------------------
+# `runner.idle_timeout_s` — runner lifetime / autotermination
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param("never", 0, id="never"),
+        pytest.param("0", 0, id="zero"),
+        pytest.param("2h", 7200, id="hours"),
+        pytest.param("30m", 1800, id="minutes"),
+        pytest.param("900", 900, id="bare-seconds"),
+    ],
+)
+def test_config_set_runner_idle_timeout_writes_nested_block(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    value: str,
+    expected: int,
+) -> None:
+    """``config set runner.idle_timeout_s=<v>`` lands under the ``runner:`` block.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    :param value: The CLI-supplied window.
+    :param expected: Seconds expected in the config file.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+
+    result = CliRunner().invoke(
+        cli, ["config", "set", "--global", f"runner.idle_timeout_s={value}"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(config_path.read_text())["runner"] == {"idle_timeout_s": expected}
+
+
+def test_config_set_runner_idle_timeout_preserves_sibling_runner_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Setting the window must not drop other ``runner:`` fields.
+
+    ``threadpool_max_workers`` shares the block, so a whole-value replace would
+    silently reset an operator's thread cap.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    config_path.write_text("runner:\n  threadpool_max_workers: 4\n", encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["config", "set", "--global", "runner.idle_timeout_s=never"])
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(config_path.read_text())["runner"] == {
+        "idle_timeout_s": 0,
+        "threadpool_max_workers": 4,
+    }
+
+
+def test_config_unset_runner_idle_timeout_keeps_sibling_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unsetting the window removes only that field, not the whole block.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    config_path.write_text(
+        "runner:\n  idle_timeout_s: 0\n  threadpool_max_workers: 4\n", encoding="utf-8"
+    )
+
+    result = CliRunner().invoke(cli, ["config", "unset", "--global", "runner.idle_timeout_s"])
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(config_path.read_text())["runner"] == {"threadpool_max_workers": 4}
+
+
+def test_config_unset_runner_idle_timeout_drops_empty_block(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Removing the only field in ``runner:`` drops the block entirely.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    config_path.write_text("model: m\nrunner:\n  idle_timeout_s: 0\n", encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["config", "unset", "--global", "runner.idle_timeout_s"])
+
+    assert result.exit_code == 0, result.output
+    cfg = yaml.safe_load(config_path.read_text())
+    assert "runner" not in cfg
+    assert cfg["model"] == "m"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("soon", id="word"),
+        pytest.param("-5m", id="negative"),
+        pytest.param("2y", id="unsupported-unit"),
+    ],
+)
+def test_config_set_runner_idle_timeout_rejects_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    value: str,
+) -> None:
+    """A malformed window is rejected by the CLI, not by the next runner at boot.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    :param value: The invalid window under test.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+
+    result = CliRunner().invoke(
+        cli, ["config", "set", "--global", f"runner.idle_timeout_s={value}"]
+    )
+
+    assert result.exit_code != 0
+    assert "runner.idle_timeout_s" in result.output
+    assert not config_path.exists(), "an invalid value must not be persisted"
+
+
+@pytest.mark.parametrize(
+    ("stored", "shown"),
+    [
+        pytest.param(0, "runner.idle_timeout_s=never", id="disabled"),
+        pytest.param(7200, "runner.idle_timeout_s=2h", id="hours"),
+        pytest.param(90, "runner.idle_timeout_s=90s", id="seconds"),
+    ],
+)
+def test_config_list_shows_runner_idle_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored: int,
+    shown: str,
+) -> None:
+    """``config list`` renders the window under the dotted key ``config set`` takes.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    :param stored: Seconds as stored in config.yaml.
+    :param shown: Expected row in the output.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+    config_path.write_text(f"runner:\n  idle_timeout_s: {stored}\n", encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert shown in result.output
+
+
+def test_config_list_omits_other_runner_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Only the settable field of ``runner:`` shows; siblings stay internal.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+    config_path.write_text("runner:\n  threadpool_max_workers: 4\n", encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "threadpool_max_workers" not in result.output
+
+
+# ---------------------------------------------------------------------------
 # `omnigent run` picks up global config defaults
 # ---------------------------------------------------------------------------
 

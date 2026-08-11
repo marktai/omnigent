@@ -120,6 +120,11 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.runner_lifetime import (
+    HARNESS_IDLE_TIMEOUT_ENV_VAR,
+    PANE_IDLE_TIMEOUT_ENV_VAR,
+    RUNNER_IDLE_TIMEOUT_ENV_VAR,
+)
 from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
 
@@ -391,6 +396,14 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # spawn the wrong auth mode while the operator set the switch on the CLI.
         # Not a secret.
         "OMNIGENT_AUTH_ENABLED",
+        # Runner lifetime knobs: how long a runner (and its harness
+        # subprocesses / native panes) may sit idle before autoterminating.
+        # These must propagate down the CLI → daemon → runner chain or a
+        # ``runner.idle_timeout_s: never`` would be stripped before the runner
+        # that has to honor it. Plain durations, not secrets.
+        RUNNER_IDLE_TIMEOUT_ENV_VAR,
+        HARNESS_IDLE_TIMEOUT_ENV_VAR,
+        PANE_IDLE_TIMEOUT_ENV_VAR,
         # Process logging controls. These are diagnostics knobs, not secrets.
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",
@@ -564,6 +577,34 @@ class HostConnectError(Exception):
     """
 
 
+def _runner_lifetime_env() -> dict[str, str]:
+    """Return the runner-lifetime env vars implied by the effective config.
+
+    Resolves ``runner.idle_timeout_s`` from the merged user+project config so a
+    project-local setting reaches the spawned runner (which reads only the
+    user-level file). A malformed value is left for the runner to reject at
+    boot rather than failing the host's spawn path here.
+
+    :returns: ``{OMNIGENT_RUNNER_IDLE_TIMEOUT_S: "<seconds>"}`` when the
+        project config sets a window, else empty.
+    """
+    import yaml
+
+    from omnigent.config import load_effective_config
+    from omnigent.runner_lifetime import (
+        RUNNER_IDLE_TIMEOUT_ENV_VAR,
+        runner_idle_timeout_from_config,
+    )
+
+    try:
+        configured = runner_idle_timeout_from_config(load_effective_config())
+    except (OSError, ValueError, yaml.YAMLError):
+        return {}
+    if configured is None:
+        return {}
+    return {RUNNER_IDLE_TIMEOUT_ENV_VAR: f"{configured:g}"}
+
+
 def _build_runner_env(
     base_env: Mapping[str, str],
     *,
@@ -639,6 +680,12 @@ def _build_runner_env(
         env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
+    # The runner reads only the USER-level config, so a project-level
+    # ``runner.idle_timeout_s`` (``.omnigent/config.yaml`` in the launch dir)
+    # has to travel as an env var or it silently wouldn't apply. setdefault so
+    # an explicit env override from the launching shell still wins.
+    for key, value in _runner_lifetime_env().items():
+        env.setdefault(key, value)
     # Bound glibc allocator RSS in the runner (no-op off Linux). Injected
     # explicitly because the allowlist above would otherwise drop an inherited
     # MALLOC_ARENA_MAX. setdefault so an operator override still wins.

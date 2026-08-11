@@ -60,6 +60,11 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
+from omnigent.runner_lifetime import (
+    HARNESS_IDLE_TIMEOUT_ENV_VAR,
+    PANE_IDLE_TIMEOUT_ENV_VAR,
+    RUNNER_IDLE_TIMEOUT_ENV_VAR,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -2260,6 +2265,116 @@ def test_build_runner_env_propagates_disable_keyring() -> None:
         parent_pid=42,
     )
     assert env["OMNIGENT_DISABLE_KEYRING"] == "1"
+
+
+def test_build_runner_env_carries_project_level_runner_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A project-level ``runner.idle_timeout_s`` reaches the spawned runner.
+
+    The runner reads only the USER-level config file, so a window set in
+    ``.omnigent/config.yaml`` would silently not apply unless the host forwards
+    it as an env var.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Stand-in project root.
+    :returns: None.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".omnigent").mkdir()
+    (tmp_path / ".omnigent" / "config.yaml").write_text(
+        "runner:\n  idle_timeout_s: never\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "empty-home"))
+
+    env = _build_runner_env(
+        {"PATH": "/usr/bin:/bin"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace=str(tmp_path),
+        parent_pid=42,
+    )
+
+    assert env[RUNNER_IDLE_TIMEOUT_ENV_VAR] == "0"
+
+
+def test_build_runner_env_ambient_runner_lifetime_wins(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An explicit env override beats the config-derived value.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Stand-in project root.
+    :returns: None.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".omnigent").mkdir()
+    (tmp_path / ".omnigent" / "config.yaml").write_text(
+        "runner:\n  idle_timeout_s: never\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "empty-home"))
+
+    env = _build_runner_env(
+        {"PATH": "/usr/bin:/bin", RUNNER_IDLE_TIMEOUT_ENV_VAR: "1800"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace=str(tmp_path),
+        parent_pid=42,
+    )
+
+    assert env[RUNNER_IDLE_TIMEOUT_ENV_VAR] == "1800"
+
+
+def test_build_runner_env_forwards_reaper_idle_knobs() -> None:
+    """The harness/pane reaper windows survive the host→runner env strip.
+
+    They ride the allowlist rather than being re-derived, so an operator who
+    tunes one reaper directly keeps that value in the runner.
+    """
+    base = {
+        "PATH": "/usr/bin:/bin",
+        HARNESS_IDLE_TIMEOUT_ENV_VAR: "600",
+        PANE_IDLE_TIMEOUT_ENV_VAR: "0",
+    }
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert env[HARNESS_IDLE_TIMEOUT_ENV_VAR] == "600"
+    assert env[PANE_IDLE_TIMEOUT_ENV_VAR] == "0"
+
+
+def test_build_runner_env_omits_lifetime_when_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No configured window means no env var, leaving the runner on its default.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Stand-in project root.
+    :returns: None.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "empty-home"))
+
+    env = _build_runner_env(
+        {"PATH": "/usr/bin:/bin"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace=str(tmp_path),
+        parent_pid=42,
+    )
+
+    assert RUNNER_IDLE_TIMEOUT_ENV_VAR not in env
 
 
 # ── host.list_dir handler ───────────────────────────────

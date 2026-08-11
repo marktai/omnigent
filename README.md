@@ -304,6 +304,29 @@ omnigent host           # (separate terminal) register this machine as a host
 In the web UI, hit **New Chat**, pick your machine, and go. Check status with
 `omnigent server status`; stop everything with `omnigent stop`.
 
+<details>
+<summary>Keeping sessions alive (runner lifetime)</summary>
+
+An idle runner shuts itself down after an hour, freeing the agent's
+subprocesses. Set the window — or turn the shutdown off entirely, so sessions
+stay up until you stop them the way a vendor TUI does:
+
+```bash
+omnigent config set --global runner.idle_timeout_s=never   # never autoterminate
+omnigent config set --global runner.idle_timeout_s=4h      # or a longer window
+omnigent config unset --global runner.idle_timeout_s       # back to the 1h default
+```
+
+Values are seconds or a duration (`90s`, `30m`, `2h`, `1d`); `0` and `never`
+both disable autotermination. Drop `--global` to set it for one project only.
+`never` also stops the reapers that reclaim idle harness subprocesses and idle
+native TUI panes, so nothing is torn down under you. Trade-off: idle sessions
+hold their memory until you stop them, which matters most on a shared host.
+
+For one-off runs, `OMNIGENT_RUNNER_IDLE_TIMEOUT_S` overrides the config.
+
+</details>
+
 ### 3. Choose & switch models
 
 ```bash

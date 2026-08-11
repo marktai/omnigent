@@ -40,6 +40,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import NamedTuple
 
+from omnigent.runner_lifetime import PANE_IDLE_TIMEOUT_ENV_VAR, parse_idle_timeout
+
 _logger = logging.getLogger(__name__)
 
 # Native CLI panes are keyed (conversation_id, <harness short name>, "main") in
@@ -68,7 +70,7 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
 # ``HarnessProcessManager``'s 1-hour SDK-proxy default for consistency.
 _DEFAULT_IDLE_TIMEOUT_S = 60 * 60
 _DEFAULT_REAPER_INTERVAL_S = 60.0
-_IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
+_IDLE_TIMEOUT_ENV = PANE_IDLE_TIMEOUT_ENV_VAR
 
 
 class PaneRef(NamedTuple):
@@ -90,34 +92,22 @@ class PaneRef(NamedTuple):
 def resolve_native_pane_idle_timeout_s() -> float:
     """Resolve the native-pane idle window in seconds.
 
-    Honors :envvar:`OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S` (``0`` disables pane
-    reaping); otherwise the 1-hour default. An unparseable or negative value
-    logs a warning and falls back to the default rather than failing the runner
-    at boot — an env typo shouldn't take the runner down or (worse) make the
-    reaper act on a bogus window.
+    Honors :envvar:`OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S` — bare seconds or a
+    duration (``30m``, ``2h``), with ``0``/``never`` disabling pane reaping;
+    otherwise the 1-hour default. The runner sets it to ``0`` when
+    ``runner.idle_timeout_s`` disables autotermination. An unparseable or
+    negative value logs a warning and falls back to the default rather than
+    failing the runner at boot or (worse) making the reaper act on a bogus
+    window.
     """
     raw = os.environ.get(_IDLE_TIMEOUT_ENV)
     if not raw:
         return float(_DEFAULT_IDLE_TIMEOUT_S)
     try:
-        value = float(raw)
-    except ValueError:
-        _logger.warning(
-            "%s=%r is not a number; using default %ss",
-            _IDLE_TIMEOUT_ENV,
-            raw,
-            _DEFAULT_IDLE_TIMEOUT_S,
-        )
+        return parse_idle_timeout(raw, label=_IDLE_TIMEOUT_ENV)
+    except ValueError as exc:
+        _logger.warning("%s; using default %ss", exc, _DEFAULT_IDLE_TIMEOUT_S)
         return float(_DEFAULT_IDLE_TIMEOUT_S)
-    if value < 0:
-        _logger.warning(
-            "%s=%r is negative; using default %ss",
-            _IDLE_TIMEOUT_ENV,
-            raw,
-            _DEFAULT_IDLE_TIMEOUT_S,
-        )
-        return float(_DEFAULT_IDLE_TIMEOUT_S)
-    return value
 
 
 class NativePaneReaper:

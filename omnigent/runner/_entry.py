@@ -27,6 +27,7 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runner_lifetime import DEFAULT_RUNNER_IDLE_TIMEOUT_S
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
@@ -41,7 +42,7 @@ _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
 # with the CLI/server/host) instead of a hard-coded placeholder.
 _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
-_DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
+_DEFAULT_RUNNER_IDLE_TIMEOUT_S = DEFAULT_RUNNER_IDLE_TIMEOUT_S
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
 # The runner offloads short native-CLI/IPC ops via asyncio.to_thread. Python's
 # default executor sizes to min(32, cpu+4) threads, which on a many-core host
@@ -113,43 +114,53 @@ def _runner_config_path() -> Path:
 
 
 def _load_runner_idle_timeout_s_from_config() -> float:
-    """Load the runner inactivity timeout from config.
+    """Resolve the runner inactivity timeout (autotermination window).
 
-    Reads ``runner.idle_timeout_s`` from the global config file. Missing
-    config or missing key defaults to 1 hour. A value of ``0`` disables the
-    inactivity watchdog. Negative, boolean, or non-numeric values fail loud
-    during runner startup so the user does not get silently different
-    lifecycle behavior than requested.
+    Reads :envvar:`OMNIGENT_RUNNER_IDLE_TIMEOUT_S` first, then
+    ``runner.idle_timeout_s`` from the global config file. Missing config or
+    missing key defaults to 1 hour. ``0`` (or ``never``) disables the
+    inactivity watchdog so the runner lives until it is stopped. Negative,
+    boolean, or unparseable values fail loud during runner startup so the user
+    does not get silently different lifecycle behavior than requested.
 
     :returns: Idle timeout in seconds, e.g. ``3600.0``. ``0.0`` disables
         the watchdog.
-    :raises RuntimeError: If ``runner.idle_timeout_s`` is invalid.
+    :raises RuntimeError: If the configured window is invalid.
     """
     import yaml
 
+    from omnigent.runner_lifetime import resolve_runner_idle_timeout_s
+
     path = _runner_config_path()
-    if not path.exists():
-        return float(_DEFAULT_RUNNER_IDLE_TIMEOUT_S)
+    raw: object = {}
+    if path.exists():
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise RuntimeError(f"failed to read runner config from {path}: {exc}") from exc
+    config = raw if isinstance(raw, dict) else {}
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(f"failed to read runner config from {path}: {exc}") from exc
-    if not isinstance(raw, dict):
-        return float(_DEFAULT_RUNNER_IDLE_TIMEOUT_S)
-    runner_cfg = raw.get("runner")
-    if runner_cfg is None:
-        return float(_DEFAULT_RUNNER_IDLE_TIMEOUT_S)
-    if not isinstance(runner_cfg, dict):
-        raise RuntimeError("runner config must be a mapping")
-    raw_timeout = runner_cfg.get("idle_timeout_s")
-    if raw_timeout is None:
-        return float(_DEFAULT_RUNNER_IDLE_TIMEOUT_S)
-    if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
-        raise RuntimeError("runner.idle_timeout_s must be a non-negative number of seconds")
-    timeout_s = float(raw_timeout)
-    if timeout_s < 0:
-        raise RuntimeError("runner.idle_timeout_s must be a non-negative number of seconds")
-    return timeout_s
+        return resolve_runner_idle_timeout_s(config, os.environ)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _apply_reaper_env_for_idle_timeout(idle_timeout_s: float) -> None:
+    """Fold the runner's idle window into the two subprocess reapers.
+
+    A disabled runner watchdog means "keep this session alive", so the harness
+    and native-pane reapers are turned off with it — otherwise their own
+    one-hour windows would still tear down the harness subprocess and TUI pane
+    under a runner that was told never to autoterminate. ``setdefault`` so an
+    explicit operator value for either reaper still wins.
+
+    :param idle_timeout_s: The resolved runner idle window in seconds.
+    :returns: None.
+    """
+    from omnigent.runner_lifetime import reaper_env_for_idle_timeout
+
+    for key, value in reaper_env_for_idle_timeout(idle_timeout_s).items():
+        os.environ.setdefault(key, value)
 
 
 def _runner_threadpool_max_workers() -> int:
@@ -1394,10 +1405,18 @@ async def _run_tunnel_from_env() -> None:
     except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
         _logger.debug("telemetry init failed in runner", exc_info=True)
 
+    # Resolve the lifetime BEFORE create_app: it constructs the harness process
+    # manager and the native-pane reaper, both of which read their own idle
+    # window from the environment at construction time.
+    idle_timeout_s = _load_runner_idle_timeout_s_from_config()
+    _apply_reaper_env_for_idle_timeout(idle_timeout_s)
+    if idle_timeout_s <= 0:
+        _logger.info("runner autotermination disabled (runner.idle_timeout_s=0)")
+    else:
+        _logger.info("runner autoterminates after %.0fs idle", idle_timeout_s)
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
     app = create_app(auth_token_factory=auth_token_factory)
-    idle_timeout_s = _load_runner_idle_timeout_s_from_config()
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan manually.
     _lifespan_cm = app.router.lifespan_context(app)
     await _lifespan_cm.__aenter__()

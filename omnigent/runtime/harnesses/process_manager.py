@@ -42,6 +42,7 @@ from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.runner_lifetime import HARNESS_IDLE_TIMEOUT_ENV_VAR, parse_idle_timeout
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
     HarnessZygoteClient,
@@ -111,15 +112,17 @@ _DEFAULT_IDLE_TIMEOUT_S = 60 * 60  # 1 hour
 _DEFAULT_REAPER_INTERVAL_S = 60
 
 # Env override for the harness idle-reap window, so operators can tune it
-# without code changes (mirrors the runner-level ``runner.idle_timeout_s``).
-# ``0`` disables harness reaping entirely.
-_HARNESS_IDLE_TIMEOUT_ENV = "OMNIGENT_HARNESS_IDLE_TIMEOUT_S"
+# without code changes. Set to ``0`` by the runner when
+# ``runner.idle_timeout_s`` disables autotermination, which disables harness
+# reaping entirely.
+_HARNESS_IDLE_TIMEOUT_ENV = HARNESS_IDLE_TIMEOUT_ENV_VAR
 
 
 def _resolve_harness_idle_timeout_s() -> float:
     """Resolve the harness idle-reap window in seconds.
 
-    Honors :envvar:`OMNIGENT_HARNESS_IDLE_TIMEOUT_S` (``0`` disables reaping);
+    Honors :envvar:`OMNIGENT_HARNESS_IDLE_TIMEOUT_S` — bare seconds or a
+    duration (``30m``, ``2h``), with ``0``/``never`` disabling reaping;
     otherwise the 1-hour default. An unparseable or negative value logs a
     warning and falls back to the default rather than failing the runner at
     boot — an env typo shouldn't take the runner down.
@@ -128,24 +131,10 @@ def _resolve_harness_idle_timeout_s() -> float:
     if not raw:
         return float(_DEFAULT_IDLE_TIMEOUT_S)
     try:
-        value = float(raw)
-    except ValueError:
-        _logger.warning(
-            "%s=%r is not a number; using default %ss",
-            _HARNESS_IDLE_TIMEOUT_ENV,
-            raw,
-            _DEFAULT_IDLE_TIMEOUT_S,
-        )
+        return parse_idle_timeout(raw, label=_HARNESS_IDLE_TIMEOUT_ENV)
+    except ValueError as exc:
+        _logger.warning("%s; using default %ss", exc, _DEFAULT_IDLE_TIMEOUT_S)
         return float(_DEFAULT_IDLE_TIMEOUT_S)
-    if value < 0:
-        _logger.warning(
-            "%s=%r is negative; using default %ss",
-            _HARNESS_IDLE_TIMEOUT_ENV,
-            raw,
-            _DEFAULT_IDLE_TIMEOUT_S,
-        )
-        return float(_DEFAULT_IDLE_TIMEOUT_S)
-    return value
 
 
 # Grace period between SIGTERM and SIGKILL when releasing a

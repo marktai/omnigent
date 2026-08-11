@@ -34,7 +34,23 @@ def test_resolve_zero_disables(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _resolve_harness_idle_timeout_s() == 0.0
 
 
-@pytest.mark.parametrize("bad", ["abc", "-5", ""])
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("30m", 1800.0, id="minutes"),
+        pytest.param("2h", 7200.0, id="hours"),
+        pytest.param("never", 0.0, id="never"),
+    ],
+)
+def test_resolve_accepts_durations_and_never(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: float
+) -> None:
+    """The reaper window shares the runner's duration/disable grammar."""
+    monkeypatch.setenv(_HARNESS_IDLE_TIMEOUT_ENV, raw)
+    assert _resolve_harness_idle_timeout_s() == expected
+
+
+@pytest.mark.parametrize("bad", ["abc", "-5", "", "2y"])
 def test_resolve_invalid_falls_back_to_default(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
     monkeypatch.setenv(_HARNESS_IDLE_TIMEOUT_ENV, bad)
     assert _resolve_harness_idle_timeout_s() == float(_DEFAULT_IDLE_TIMEOUT_S)
