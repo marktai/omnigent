@@ -286,6 +286,7 @@ def test_parse_valid_blaxel_config_builds_parameterized_factory(
     )
 
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.server_url == "https://srv.example.com"
     assert cfg.token_ttl_s == blaxel_managed_token_ttl_s("24h")
     assert cfg.managed_launch_supported is True
@@ -305,6 +306,7 @@ def test_parse_blaxel_without_section_uses_launcher_fallbacks(
     cfg = parse_sandbox_config({"provider": "blaxel", "server_url": "https://s.example"})
 
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_blaxel_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -331,6 +333,7 @@ def test_parse_blaxel_token_ttl_tracks_configured_sandbox_ttl() -> None:
     )
 
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.token_ttl_s == 7 * 24 * 3600 + 3600
     assert cfg.token_ttl_s > blaxel_managed_token_ttl_s()
 
