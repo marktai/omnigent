@@ -138,7 +138,15 @@ describe("BlockRenderer dispatch", () => {
     expect(alert).toHaveClass("min-w-0");
     expect(alert).toHaveClass("overflow-hidden");
 
-    const description = container.querySelector('[data-slot="alert-description"]');
+    // Diagnostics are folded away by default — expand the dropdown to read them.
+    expect(screen.queryByText(/Required terminal exited unexpectedly/)).toBeNull();
+    const trigger = alert.querySelector('[data-slot="collapsible-trigger"]');
+    expect(trigger).not.toBeNull();
+    act(() => {
+      fireEvent.click(trigger as Element);
+    });
+
+    const description = container.querySelector('[data-slot="error-details"]');
     expect(description).not.toBeNull();
     expect(description).toHaveClass("min-w-0");
     expect(description).toHaveClass("overflow-hidden");
@@ -171,14 +179,20 @@ describe("BlockRenderer dispatch", () => {
 
     render(<BlockRenderer items={items} sessionStatus="idle" />);
 
-    // Headline is the friendly title, not the raw code.
+    // Headline is the friendly title, not the raw code — always visible.
     expect(screen.getByText("Claude Code can't run as root")).toBeDefined();
-    // Cause is shown in plain English.
+    // Cause, remediation, and raw diagnostics fold into the dropdown (collapsed).
+    expect(screen.queryByText(/refuses the flag as root/)).toBeNull();
+    expect(screen.queryByText(/Run the host as a non-root user/)).toBeNull();
+
+    const alert = screen.getByRole("alert");
+    act(() => {
+      fireEvent.click(alert.querySelector('[data-slot="collapsible-trigger"]') as Element);
+    });
+
+    // Once expanded, the plain-English cause and the fix are both surfaced.
     expect(screen.getByText(/refuses the flag as root/)).toBeDefined();
-    // Remediation is surfaced.
     expect(screen.getByText(/Run the host as a non-root user/)).toBeDefined();
-    // Raw diagnostics are folded away behind a Details toggle (collapsed).
-    expect(screen.getByText(/Details/)).toBeDefined();
     // The raw enum is NOT the visible headline.
     expect(screen.queryByText(/Error · required_terminal_exited/)).toBeNull();
   });

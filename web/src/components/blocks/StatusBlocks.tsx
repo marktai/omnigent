@@ -1,7 +1,8 @@
 // Inline status indicators for non-tool, non-text, non-reasoning blocks.
 // Each is small enough to live in one file.
 //
-// - ErrorBanner: destructive Alert with `[source]` + code + message.
+// - ErrorBanner: collapsible panel with a compact, tinted headline and the
+//   explanation, remediation, and raw diagnostics folded into the dropdown.
 // - RetryIndicator: muted one-liner about an in-flight retry.
 // - CompactionMarker: permanent marker shown after compaction completes.
 //   The in-progress state renders as a Shimmer in ChatPage, mirroring
@@ -60,14 +61,16 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
 };
 
 /**
- * Loud destructive banner for `error` blocks.
+ * Collapsible panel for `error` blocks. The always-visible header carries only a
+ * tinted icon + headline, so a failure no longer renders as a wall of red. The
+ * explanation, "Try this" remediation, and raw diagnostics fold into the
+ * dropdown.
  *
  * When the runner classified the failure it passes `title` / `cause` /
- * `remediation`, and the banner renders a clear card: headline, plain-English
- * cause, a "Try this" remediation line, and the raw diagnostics folded into a
- * collapsible. Otherwise it falls back to a code→sentence map (so even an
- * unclassified failure reads as English) and finally to the raw message/code —
- * never a blank panel.
+ * `remediation`; otherwise the headline falls back to a code→sentence map (so
+ * even an unclassified failure reads as English) and finally to a generic
+ * fallback — never a blank panel. With nothing to fold, the panel degrades to a
+ * single compact header row.
  */
 export function ErrorBanner({
   message,
@@ -90,43 +93,64 @@ export function ErrorBanner({
   // keep it available but folded away. Without one, the message is already the
   // explanation, so there's nothing extra to fold.
   const details = title && message && message !== explanation ? message : null;
+  const hasDetails = Boolean(explanation || remediation || details);
 
-  return (
-    <Alert
-      variant="destructive"
-      className="min-w-0 max-w-full overflow-hidden has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
-    >
-      <AlertCircleIcon />
-      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
+  const containerClass = cn(
+    "not-prose my-1 min-w-0 max-w-full overflow-hidden rounded-md border border-destructive/30 bg-destructive/5",
+    TOOL_SURFACE_WIDTH_CLASS,
+  );
+  // Only the icon and headline are tinted; the rest reads as normal text.
+  const header = (
+    <>
+      <AlertCircleIcon className="size-3.5 shrink-0 text-destructive" />
+      <span className="min-w-0 font-medium text-destructive [overflow-wrap:anywhere]">
         {headline}
         {source ? ` · ${source}` : ""}
-      </AlertTitle>
-      <AlertDescription className="min-w-0 max-w-full space-y-2 overflow-hidden">
+      </span>
+    </>
+  );
+
+  // Nothing to expand — just the compact tinted header.
+  if (!hasDetails) {
+    return (
+      <div
+        role="alert"
+        data-testid="error-block"
+        className={cn(containerClass, "flex items-center gap-1.5 px-3 py-2 text-xs")}
+      >
+        {header}
+      </div>
+    );
+  }
+
+  return (
+    <Collapsible role="alert" data-testid="error-block" className={cn("group", containerClass)}>
+      <CollapsibleTrigger className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 px-3 py-2 text-left text-xs">
+        {header}
+        <ChevronRightIcon className="ml-auto size-3 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-90" />
+      </CollapsibleTrigger>
+      <CollapsibleContent
+        data-slot="error-details"
+        className="min-w-0 max-w-full space-y-2 overflow-hidden px-3 pb-2 text-xs data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in"
+      >
         {explanation ? (
-          <span className="block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] [text-wrap:wrap]">
+          <span className="block max-w-full whitespace-pre-wrap break-words text-foreground [overflow-wrap:anywhere] [text-wrap:wrap]">
             {explanation}
           </span>
         ) : null}
         {remediation ? (
-          <span className="block max-w-full break-words font-medium [overflow-wrap:anywhere]">
+          <span className="block max-w-full break-words font-medium text-foreground [overflow-wrap:anywhere]">
             Try this: {remediation}
           </span>
         ) : null}
         {details ? (
-          <Collapsible>
-            <CollapsibleTrigger className="group flex items-center gap-1 text-xs opacity-80 hover:opacity-100">
-              <ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
-              Details{code ? ` · ${code}` : ""}
-            </CollapsibleTrigger>
-            <CollapsibleContent>
-              <span className="mt-1 block max-w-full whitespace-pre-wrap break-words font-mono text-xs opacity-80 [overflow-wrap:anywhere] [text-wrap:wrap]">
-                {details}
-              </span>
-            </CollapsibleContent>
-          </Collapsible>
+          <span className="block max-w-full whitespace-pre-wrap break-words font-mono text-muted-foreground [overflow-wrap:anywhere] [text-wrap:wrap]">
+            {code ? `${code}\n` : ""}
+            {details}
+          </span>
         ) : null}
-      </AlertDescription>
-    </Alert>
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 
