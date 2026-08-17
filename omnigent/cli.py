@@ -5734,6 +5734,7 @@ def import_session_command(
     import httpx
 
     from omnigent.chat import _remote_headers
+    from omnigent.conversation_browser import conversation_url
     from omnigent.session_import import (
         ImportSource,
         SessionImportNotFoundError,
@@ -5839,13 +5840,17 @@ def import_session_command(
             )
             continue
         imported_count += 1
+        # Surface the browser URL, not the bare id, so the user can open the
+        # imported session straight into the web (where it offers the resume
+        # picker). Maps a Databricks API base to its workspace SPA link.
+        session_link = conversation_url(base_url, session_id)
         if is_batch:
             click.echo(
                 f"Imported {item_count} item(s) from {current_source_session_id} "
-                f"into {session_id}."
+                f"into {session_link}"
             )
         else:
-            click.echo(f"Imported {item_count} item(s) into {session_id}.")
+            click.echo(f"Imported {item_count} item(s) into {session_link}")
 
     if is_batch:
         click.echo(f"\nImported: {imported_count}")
