@@ -46,6 +46,7 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
+from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import open_conversation_link_if_enabled
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
@@ -565,7 +566,7 @@ def run_attach(
             f"Session {conversation_id} has no online runner on "
             f"{display_server_url(base_url)} — its "
             "host is offline. `attach` never starts a runner; bring the host back "
-            "(`omnigent run` locally, or reconnect it with `omnigent host`), "
+            f"(`{cli_invocation()} run` locally, or reconnect it with `{cli_invocation()} host`), "
             "then attach again."
         )
 
@@ -1535,7 +1536,7 @@ def _unreachable_server_message(base_url: str) -> str:
     if is_loopback_url(base_url):
         return (
             f"Could not connect to the local Omnigent server at {base_url}. "
-            "It may have stopped — run `omnigent stop`, then try again. "
+            f"It may have stopped — run `{cli_invocation()} stop`, then try again. "
             f"Server logs are under {process_log_dir_reference('server')}."
         )
     from omnigent.server_url import display_server_url
@@ -1946,7 +1947,8 @@ def _poll_remote_runner(
             if resp.status_code in {401, 403}:
                 raise click.ClickException(
                     f"Remote runner status check was rejected ({resp.status_code}); "
-                    "run `omnigent login <server-url>` or check remote auth credentials."
+                    f"run `{cli_invocation()} login <server-url>` "
+                    "or check remote auth credentials."
                     f"{format_runner_log_tail(log_path)}"
                 )
         except httpx.HTTPError as exc:
@@ -2287,13 +2289,13 @@ async def _query_sessions_once(
         if runner_id is None:
             raise RuntimeError(
                 "This server has no online runner to run the turn. Start one against "
-                "it with `omnigent host --server <url>` (or run the agent locally "
-                "with `omnigent run <agent.yaml>`), then retry."
+                f"it with `{cli_invocation()} host --server <url>` (or run the agent locally "
+                f"with `{cli_invocation()} run <agent.yaml>`), then retry."
             )
     if runner_id is None:
         raise RuntimeError(
             "Sessions API headless prompt requires a registered runner id. "
-            "Start through `omnigent run <agent>` or pass --server so the CLI "
+            f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
             "can launch and bind a runner."
         )
     tool_callables = _sessions_tool_callables(tool_handler, agent_name)
