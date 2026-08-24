@@ -10947,6 +10947,51 @@ def _host_with_org(workspace_host: str, org_id: str | None) -> str:
     )
 
 
+def _databricks_default_workspace_id(workspace_host: str) -> str | None:
+    """Return the workspace id the Databricks CLI recorded for *workspace_host*.
+
+    Thin, mockable wrapper over
+    :func:`omnigent.inner.databricks_executor.databrickscfg_workspace_id_for_host`.
+    An account-fronting login carries no ``?o=`` selector, yet the CLI resolves a
+    workspace during login and records its id; the account token routes to it
+    once that id is replayed as ``?o=``. Inheriting it lets the login succeed
+    without the user restating a workspace the CLI already chose.
+
+    :param workspace_host: The workspace host, e.g.
+        ``"https://example.databricks.com"``.
+    :returns: The recorded workspace id, or ``None`` when none is recorded.
+    """
+    from omnigent.inner.databricks_executor import databrickscfg_workspace_id_for_host
+
+    return databrickscfg_workspace_id_for_host(workspace_host)
+
+
+def _databricks_host_needs_org_selector(workspace_host: str) -> bool:
+    """Whether *workspace_host* fronts many workspaces and needs a ``?o=`` selector.
+
+    Reads the host's unauthenticated ``/.well-known/databricks-config`` discovery
+    document. A host acting as an account (many workspaces under one hostname)
+    reports an ``account_id`` but no ``workspace_id``; a single workspace reports
+    its own ``workspace_id``. Such a login carries no ``?o=<workspace-id>``
+    selector, so we gate the inherit-the-CLI-selected-workspace path on this,
+    leaving genuine single-workspace mounts untouched.
+
+    :param workspace_host: The workspace host, e.g.
+        ``"https://example.databricks.com"``.
+    :returns: ``True`` only when the metadata positively identifies an
+        account-acting host. Any fetch/parse failure — or inconclusive
+        metadata (older regional hosts report neither id) — returns ``False``
+        so a discovery outage never changes an otherwise-valid login.
+    """
+    try:
+        from databricks.sdk.oauth import get_host_metadata
+
+        meta = get_host_metadata(workspace_host)
+    except Exception:  # noqa: BLE001 - any discovery failure means "can't tell"; never block login on it
+        return False
+    return not meta.workspace_id and bool(meta.account_id)
+
+
 def _databricks_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
     """Log in to a Databricks-fronted Omnigent server.
 
@@ -10989,11 +11034,33 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"{DATABRICKS_EXTRA_INSTALL_HINT}"
         )
 
+    from omnigent.cli_auth import is_workspace_hosted_url
+
+    # An account-fronting workspace mount serves many workspaces under one host,
+    # so the login URL carries no ?o= selector — but the Databricks CLI still
+    # resolves a workspace during login. Recognize that shape (from discovery
+    # metadata) so the resolved workspace can be inherited below instead of
+    # failing on the bare account host, which answers 503/403.
+    account_host_without_selector = (
+        org_id is None
+        and is_workspace_hosted_url(server)
+        and _databricks_host_needs_org_selector(workspace_host)
+    )
+
     token = _databricks_workspace_token(workspace_host)
     fresh_login_done = False
     if token is None:
         token = _login_and_mint_workspace_token(workspace_host, org_id)
         fresh_login_done = True
+
+    # Inherit the workspace the CLI selected: the browser login (or a prior one)
+    # auto-selected a workspace and recorded its id in the profile; replaying it
+    # as ?o= routes the account token to that workspace. Without it the login
+    # would fail on an account host it could have completed unattended.
+    if account_host_without_selector:
+        org_id = _databricks_default_workspace_id(workspace_host)
+        if org_id:
+            click.echo(f"Routing to workspace {org_id}, selected during the Databricks login.")
 
     # Verify the workspace token actually gets through the edge to THIS
     # server (the user may lack access to it), and learn our identity
