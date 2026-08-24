@@ -5877,11 +5877,12 @@ class _SessionImportResult:
 @click.option(
     "--harness",
     type=click.Choice(
-        ["claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"],
+        ["all", "claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"],
         case_sensitive=False,
     ),
     required=True,
-    help="Local coding harness that owns the source session.",
+    help="Local coding harness that owns the source session, or 'all' (with --last) "
+    "to import from every supported harness.",
 )
 @click.option(
     "--session",
@@ -5893,10 +5894,10 @@ class _SessionImportResult:
 @click.option(
     "--last",
     "recent_session_count",
-    type=click.IntRange(min=1, max=50),
+    type=click.IntRange(min=1, max=100),
     default=None,
     metavar="N",
-    help="Import the N most recently modified parent sessions (maximum 50).",
+    help="Import the N most recently modified parent sessions (maximum 100).",
 )
 @click.option(
     "--server",
@@ -5946,25 +5947,45 @@ def import_session_command(
     )
     from omnigent.session_import.local import (
         list_recent_local_session_ids,
+        list_recent_sessions_across_harnesses,
         load_local_session,
     )
 
     if (source_session_id is None) == (recent_session_count is None):
         raise click.UsageError("Provide exactly one of --session or --last.")
 
-    source = cast(ImportSource, harness.lower())
+    harness = harness.lower()
+    all_harnesses = harness == "all"
+    if all_harnesses and source_session_id is not None:
+        raise click.UsageError(
+            "--harness all requires --last (a session id belongs to one harness)."
+        )
+
     is_batch = recent_session_count is not None
+    # Each target is a (harness, session-id) pair so an "all" batch can span
+    # harnesses; a single-harness run just yields one harness's ids.
+    import_targets: list[tuple[ImportSource, str]] = []
     if recent_session_count is not None:
-        try:
-            recent_ids = list_recent_local_session_ids(source, limit=recent_session_count)
-        except SessionImportNotFoundError as exc:
-            raise click.ClickException(str(exc)) from exc
-        if not recent_ids:
-            raise click.ClickException(f"No local {source} parent sessions were found")
-        source_session_ids = tuple(reversed(recent_ids))
+        if all_harnesses:
+            # Merge every harness into one global recency order, keep the top N
+            # (so "last N" is N total, not N per harness). Oldest first so the
+            # newest import lands atop the sidebar.
+            import_targets = list(
+                reversed(list_recent_sessions_across_harnesses(limit=recent_session_count))
+            )
+        else:
+            src = cast(ImportSource, harness)
+            try:
+                recent_ids = list_recent_local_session_ids(src, limit=recent_session_count)
+            except SessionImportNotFoundError as exc:
+                raise click.ClickException(str(exc)) from exc
+            import_targets = [(src, sid) for sid in reversed(recent_ids)]
+        if not import_targets:
+            scope = "any harness" if all_harnesses else harness
+            raise click.ClickException(f"No local {scope} parent sessions were found")
     else:
         assert source_session_id is not None
-        source_session_ids = (source_session_id,)
+        import_targets = [(cast(ImportSource, harness), source_session_id)]
 
     cfg = _load_effective_config()
     base_url = _resolve_attach_server(server, cfg.get("server"))
@@ -5972,9 +5993,11 @@ def import_session_command(
         base_url = ensure_local_omnigent_server().url
     base_url = base_url.rstrip("/")
 
-    def _import_one(sid: str) -> _SessionImportResult:
+    def _import_one(target: tuple[ImportSource, str]) -> _SessionImportResult:
+        # Each target carries its own harness so an "all" batch can span them.
+        current_source, sid = target
         try:
-            imported = load_local_session(source, sid)
+            imported = load_local_session(current_source, sid)
         except SessionImportNotFoundError as exc:
             return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
         except (OSError, TypeError, ValueError) as exc:
@@ -6042,7 +6065,7 @@ def import_session_command(
         )
 
     if not is_batch:
-        result = _import_one(source_session_ids[0])
+        result = _import_one(import_targets[0])
         if result.status == "imported":
             click.echo(f"Imported {result.item_count} item(s) into {result.link}")
             return
@@ -6061,13 +6084,13 @@ def import_session_command(
     # the per-URL SDK cache before the workers fan out, rather than have each
     # worker cold-mint it in parallel.
     _remote_headers(server_url=base_url, host_id=None)
-    results: dict[str, _SessionImportResult] = {}
-    max_workers = min(len(source_session_ids), _IMPORT_BATCH_MAX_WORKERS)
+    results: dict[tuple[ImportSource, str], _SessionImportResult] = {}
+    max_workers = min(len(import_targets), _IMPORT_BATCH_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_import_one, sid): sid for sid in source_session_ids}
+        futures = {executor.submit(_import_one, target): target for target in import_targets}
         for future in concurrent.futures.as_completed(futures):
-            outcome = future.result()
-            results[outcome.session_id] = outcome
+            target = futures[future]
+            results[target] = future.result()
 
     # A network failure is fatal for the whole batch, matching the serial import.
     unreachable = next((r for r in results.values() if r.status == "unreachable"), None)
@@ -6078,8 +6101,9 @@ def import_session_command(
     already_imported_count = 0
     failed_count = 0
     # Report in the caller's requested order, not worker completion order.
-    for sid in source_session_ids:
-        outcome = results[sid]
+    for target in import_targets:
+        sid = target[1]
+        outcome = results[target]
         if outcome.status == "imported":
             imported_count += 1
             click.echo(f"Imported {outcome.item_count} item(s) from {sid} into {outcome.link}")

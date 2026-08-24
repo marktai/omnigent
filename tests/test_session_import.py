@@ -177,7 +177,9 @@ def test_list_recent_opencode_sessions_uses_public_cli(
     """OpenCode batch discovery uses its supported JSON listing command."""
     calls: list[tuple[str, ...]] = []
 
-    def fake_run(*arguments: str, opencode_path: str | None = None) -> object:
+    def fake_run(
+        *arguments: str, opencode_path: str | None = None, empty_ok: bool = False
+    ) -> object:
         assert opencode_path is None
         calls.append(arguments)
         return [
@@ -196,10 +198,26 @@ def test_list_recent_opencode_sessions_rejects_schema_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A changed public listing schema reports a contract error."""
-    monkeypatch.setattr(local_import, "_run_opencode_json", lambda *arguments: {})
+    monkeypatch.setattr(local_import, "_run_opencode_json", lambda *arguments, **kwargs: {})
 
     with pytest.raises(SessionImportNotFoundError, match="invalid session list"):
         list_recent_local_session_ids("opencode", limit=1)
+
+
+def test_list_recent_opencode_sessions_treats_empty_output_as_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no sessions OpenCode prints nothing (exit 0) — not an error."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(local_import, "find_opencode_cli", lambda path: "/fake/opencode")
+    monkeypatch.setattr(
+        local_import.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    assert list_recent_local_session_ids("opencode", limit=5) == ()
 
 
 def test_load_opencode_session_preserves_messages_files_and_tools(
@@ -1409,3 +1427,43 @@ def test_list_recent_kimi_sessions_uses_wire_recency(tmp_path: Path, monkeypatch
     recent = list_recent_local_session_ids("kimi", limit=10)
 
     assert recent == ("session_new", "session_old")
+
+
+def test_list_recent_sessions_across_harnesses_merges_by_global_recency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'all' keeps the globally-newest sessions, not `limit` per harness."""
+    per_source = {
+        "claude": [("c_new", 100.0), ("c_old", 10.0)],
+        "codex": [("x_mid", 50.0), ("x_older", 5.0)],
+    }
+
+    def fake_recency(source: str, *, limit: int) -> list[tuple[str, float]]:
+        return per_source.get(source, [])[:limit]
+
+    monkeypatch.setattr(local_import, "_recent_local_sessions_with_recency", fake_recency)
+
+    result = local_import.list_recent_sessions_across_harnesses(limit=3)
+
+    # Top 3 by global recency, newest first — not 3 from each harness.
+    assert result == [("claude", "c_new"), ("codex", "x_mid"), ("claude", "c_old")]
+
+
+def test_list_recent_sessions_across_harnesses_normalizes_millisecond_recency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A millisecond timestamp (OpenCode) must not always outrank mtime seconds."""
+    per_source = {
+        # OpenCode reports epoch millis; claude's mtime seconds is actually newer.
+        "opencode": [("o1", 1_700_000_000_000.0)],
+        "claude": [("c1", 1_700_000_500.0)],
+    }
+
+    def fake_recency(source: str, *, limit: int) -> list[tuple[str, float]]:
+        return per_source.get(source, [])[:limit]
+
+    monkeypatch.setattr(local_import, "_recent_local_sessions_with_recency", fake_recency)
+
+    result = local_import.list_recent_sessions_across_harnesses(limit=1)
+
+    assert result == [("claude", "c1")]

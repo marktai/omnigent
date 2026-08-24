@@ -48,6 +48,10 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
+    HostImportLocalDoneFrame,
+    HostImportLocalFrame,
+    HostImportLocalSessionFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -1929,6 +1933,107 @@ class HostProcess:
             canonical_path=canonical,
         )
 
+    async def _handle_import_local(
+        self, ws: websockets.asyncio.client.ClientConnection, frame: HostImportLocalFrame
+    ) -> None:
+        """Stream the host's recent local transcripts, one frame per session.
+
+        The host owns the session files (``~/.claude`` etc.). It enumerates the
+        targets ("all" merges every harness into one global recency order, top
+        ``limit`` total), then reads + normalizes each and sends it immediately
+        (``host.import_local_session``) so a large batch never rides in one frame
+        and the server persists as each arrives. A terminal ``host.import_local_done``
+        closes the stream. Sessions that fail to load are skipped; a single-harness
+        enumeration failure fails the request.
+        """
+
+        def _targets() -> tuple[list[tuple[str, str]], str | None]:
+            from omnigent.session_import.local import (
+                list_recent_local_session_ids,
+                list_recent_sessions_across_harnesses,
+            )
+            from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
+
+            if frame.source == "all":
+                return list(list_recent_sessions_across_harnesses(limit=frame.limit)), None
+            source = cast(ImportSource, frame.source)
+            try:
+                ids = list_recent_local_session_ids(source, limit=frame.limit)
+            except SessionImportNotFoundError:
+                return [], None
+            except (OSError, ValueError, TypeError) as exc:
+                return [], str(exc)
+            return [(source, sid) for sid in ids], None
+
+        def _load(source: str, session_id: str) -> HostImportedLocalSession | None:
+            from omnigent.session_import.local import load_local_session
+            from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
+
+            try:
+                local = load_local_session(cast(ImportSource, source), session_id)
+            except (SessionImportNotFoundError, OSError, ValueError, TypeError):
+                return None
+            return HostImportedLocalSession(
+                external_session_id=local.external_session_id,
+                workspace=local.workspace,
+                items=[
+                    {
+                        "type": item.type,
+                        "response_id": item.response_id,
+                        "data": item.data.model_dump(mode="json", exclude_none=True),
+                    }
+                    for item in local.items
+                ],
+                title=local.title,
+                source=local.source,
+            )
+
+        try:
+            targets, enum_error = await asyncio.to_thread(_targets)
+            if enum_error is not None:
+                await ws.send(
+                    encode_host_frame(
+                        HostImportLocalDoneFrame(
+                            request_id=frame.request_id, status="failed", error=enum_error
+                        )
+                    )
+                )
+                return
+
+            # Oldest first so the server imports newest last → newest sits atop the sidebar.
+            ordered = list(reversed(targets))
+            total = len(ordered)
+            for source, session_id in ordered:
+                session = await asyncio.to_thread(_load, source, session_id)
+                if session is None:
+                    continue
+                await ws.send(
+                    encode_host_frame(
+                        HostImportLocalSessionFrame(
+                            request_id=frame.request_id, total=total, session=session
+                        )
+                    )
+                )
+            await ws.send(
+                encode_host_frame(
+                    HostImportLocalDoneFrame(request_id=frame.request_id, status="ok")
+                )
+            )
+        except ConnectionClosed:
+            raise  # tunnel died mid-stream; _run_frame_handler owns recovery
+        except Exception as exc:
+            # Send a terminal failure so the server fails fast instead of waiting
+            # out its per-frame timeout on an unanswered request.
+            _logger.exception("import_local handler failed for source=%r", frame.source)
+            with contextlib.suppress(Exception):
+                await ws.send(
+                    encode_host_frame(
+                        HostImportLocalDoneFrame(
+                            request_id=frame.request_id, status="failed", error=str(exc)
+                        )
+                    )
+                )
+
     def _handle_list_dir(self, frame: HostListDirFrame) -> HostListDirResultFrame:
         """Handle a ``host.list_dir`` request from the server.
 
@@ -3573,6 +3678,10 @@ class HostProcess:
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
             await ws.send(encode_host_frame(options_result))
+        elif isinstance(frame, HostImportLocalFrame):
+            # Streams one host.import_local_session per session (reads run off the
+            # event loop inside), then a terminal host.import_local_done.
+            await self._handle_import_local(ws, frame)
 
 
 def run_host_process(

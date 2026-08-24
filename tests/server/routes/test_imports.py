@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.errors import OmnigentError
+from omnigent.server.routes.imports import _stream_local_sessions_from_host
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
@@ -203,3 +207,86 @@ async def test_import_session_rejects_empty_history(client: httpx.AsyncClient) -
     )
 
     assert response.status_code == 422
+
+
+def test_imported_session_ref_allows_null_title() -> None:
+    """A batch session with no synthesizable title must not fail the response.
+
+    ``title_from_items`` returns None when there is no first user message to
+    derive a title from; the /imports/local batch builds one ImportedSessionRef
+    per new session, so a None title must validate instead of 500-ing the run.
+    """
+    from omnigent.server.routes.imports import ImportedSessionRef
+
+    assert ImportedSessionRef(session_id="conv_x").title is None
+    assert ImportedSessionRef(session_id="conv_y", title=None).title is None
+
+
+async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
+    """The streaming consumer yields one session per frame, then cleans up on done.
+
+    Fakes the tunnel by having ``send_text`` push session frames + a terminal
+    ``done`` onto the per-request queue the generator just registered.
+    """
+    conn = SimpleNamespace(host_id="h1", pending_import_local={})
+    canned = [
+        {
+            "external_session_id": "c1",
+            "workspace": None,
+            "items": [],
+            "title": "one",
+            "source": "claude",
+            "total": 2,
+        },
+        {
+            "external_session_id": "c2",
+            "workspace": None,
+            "items": [],
+            "title": None,
+            "source": "codex",
+            "total": 2,
+        },
+    ]
+
+    class _Reg:
+        def send_text(self, host_conn: object, frame: str) -> None:
+            (queue,) = conn.pending_import_local.values()
+            for session in canned:
+                queue.put_nowait(("session", session))
+            queue.put_nowait(("done", {"status": "ok", "error": None}))
+
+    got = [
+        session
+        async for session in _stream_local_sessions_from_host(
+            host_registry=_Reg(),  # type: ignore[arg-type]
+            host_conn=conn,  # type: ignore[arg-type]
+            source="all",
+            limit=5,
+        )
+    ]
+
+    assert [s["external_session_id"] for s in got] == ["c1", "c2"]
+    # The per-request queue is removed once the stream ends.
+    assert conn.pending_import_local == {}
+
+
+async def test_stream_local_sessions_raises_on_failed_done() -> None:
+    """A ``done`` frame with status='failed' surfaces the host's error, not a hang."""
+    conn = SimpleNamespace(host_id="h1", pending_import_local={})
+
+    class _Reg:
+        def send_text(self, host_conn: object, frame: str) -> None:
+            (queue,) = conn.pending_import_local.values()
+            queue.put_nowait(("done", {"status": "failed", "error": "host blew up"}))
+
+    with pytest.raises(OmnigentError, match="host blew up"):
+        _ = [
+            session
+            async for session in _stream_local_sessions_from_host(
+                host_registry=_Reg(),  # type: ignore[arg-type]
+                host_conn=conn,  # type: ignore[arg-type]
+                source="claude",
+                limit=5,
+            )
+        ]
+    assert conn.pending_import_local == {}

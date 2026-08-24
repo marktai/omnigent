@@ -35,6 +35,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportLocalDoneFrame,
+    HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
@@ -736,6 +738,29 @@ async def _receive_loop(
                         "error": frame.error,
                     }
                 )
+            continue
+        if isinstance(frame, HostImportLocalSessionFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is not None:
+                s = frame.session
+                queue.put_nowait(
+                    (
+                        "session",
+                        {
+                            "total": frame.total,
+                            "external_session_id": s.external_session_id,
+                            "workspace": s.workspace,
+                            "items": s.items,
+                            "title": s.title,
+                            "source": s.source,
+                        },
+                    )
+                )
+            continue
+        if isinstance(frame, HostImportLocalDoneFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is not None:
+                queue.put_nowait(("done", {"status": frame.status, "error": frame.error}))
             continue
 
         _logger.debug(

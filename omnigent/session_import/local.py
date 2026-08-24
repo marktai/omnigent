@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 from hashlib import sha256
 from pathlib import Path
+from typing import get_args
 
 from omnigent.claude_native_bridge import read_transcript_items_from_offset
 from omnigent.codex_native import _CODEX_THREAD_ID_RE, _find_codex_rollout
@@ -60,12 +61,16 @@ def _find_transcript(root: Path, session_id: str) -> Path | None:
     return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
 
 
-def _recent_unique_session_ids(
+def _recent_unique_sessions_with_recency(
     candidates: list[tuple[Path, str]],
     *,
     limit: int,
-) -> tuple[str, ...]:
-    """Return unique session ids ordered from newest transcript to oldest."""
+) -> list[tuple[str, float]]:
+    """Return ``(session_id, recency)`` pairs, newest transcript first.
+
+    ``recency`` is the newest mtime seen for that id, kept so callers can merge
+    sessions across harnesses by a single global recency order.
+    """
     newest_by_id: dict[str, float] = {}
     for path, session_id in candidates:
         try:
@@ -78,7 +83,16 @@ def _recent_unique_session_ids(
         key=lambda session_id: (newest_by_id[session_id], session_id),
         reverse=True,
     )
-    return tuple(ordered[:limit])
+    return [(session_id, newest_by_id[session_id]) for session_id in ordered[:limit]]
+
+
+def _recent_unique_session_ids(
+    candidates: list[tuple[Path, str]],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """Return unique session ids ordered from newest transcript to oldest."""
+    return tuple(sid for sid, _ in _recent_unique_sessions_with_recency(candidates, limit=limit))
 
 
 def _pi_session_id_from_path(path: Path) -> str | None:
@@ -113,8 +127,14 @@ def _is_safe_opencode_import_session_id(session_id: str) -> bool:
 def _run_opencode_json(
     *arguments: str,
     opencode_path: str | None = None,
+    empty_ok: bool = False,
 ) -> object:
-    """Run one public OpenCode JSON command and decode stdout."""
+    """Run one public OpenCode JSON command and decode stdout.
+
+    With no sessions, ``session list`` prints nothing (exit 0) rather than
+    ``[]``; ``empty_ok`` treats that empty stdout as an empty result instead of
+    an "invalid JSON" error.
+    """
     try:
         cli = find_opencode_cli(opencode_path)
     except OpenCodeCliNotFoundError as exc:
@@ -133,6 +153,8 @@ def _run_opencode_json(
         detail = completed.stderr.strip().splitlines()
         suffix = f": {detail[-1]}" if detail else ""
         raise SessionImportNotFoundError(f"OpenCode command failed{suffix}")
+    if empty_ok and not completed.stdout.strip():
+        return []
     try:
         return json.loads(completed.stdout)
     except ValueError as exc:
@@ -153,12 +175,12 @@ def _qwen_session_locator(path: Path) -> str:
     return f"{project_digest}:{sha256(session_id.encode()).hexdigest()}"
 
 
-def list_recent_local_session_ids(
+def _recent_local_sessions_with_recency(
     source: ImportSource,
     *,
     limit: int,
-) -> tuple[str, ...]:
-    """List recent parent session ids for one local harness."""
+) -> list[tuple[str, float]]:
+    """List recent ``(session_id, recency)`` pairs for one local harness, newest first."""
     if source == "claude":
         configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
         home = Path(configured_home).expanduser() if configured_home else Path.home() / ".claude"
@@ -168,14 +190,14 @@ def list_recent_local_session_ids(
             for path in root.rglob("*.jsonl")
             if "subagents" not in path.parts and path.is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "qwen":
         configured_home = os.environ.get("QWEN_HOME")
         home = Path(configured_home).expanduser() if configured_home else Path.home() / ".qwen"
         paths = [path for path in (home / "projects").glob("*/chats/*.jsonl") if path.is_file()]
         candidates = [(path, _qwen_session_locator(path)) for path in paths]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "kiro":
         root = kiro_cli_sessions_dir()
@@ -184,7 +206,7 @@ def list_recent_local_session_ids(
             for path in root.glob("*.jsonl")
             if path.is_file() and path.with_suffix(".json").is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "opencode":
         payload = _run_opencode_json(
@@ -193,6 +215,7 @@ def list_recent_local_session_ids(
             "--format",
             "json",
             "--pure",
+            empty_ok=True,
         )
         if not isinstance(payload, list):
             raise SessionImportNotFoundError("OpenCode returned an invalid session list")
@@ -213,7 +236,7 @@ def list_recent_local_session_ids(
             key=lambda session_id: (updated_by_id[session_id], session_id),
             reverse=True,
         )
-        return tuple(ordered[:limit])
+        return [(session_id, float(updated_by_id[session_id])) for session_id in ordered[:limit]]
 
     if source == "pi":
         configured_home = os.environ.get("PI_CODING_AGENT_DIR")
@@ -228,7 +251,7 @@ def list_recent_local_session_ids(
             for path in (home / "sessions").rglob("*.jsonl")
             if path.is_file() and (session_id := _pi_session_id_from_path(path)) is not None
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "kimi":
         home = resolve_user_kimi_home()
@@ -237,7 +260,7 @@ def list_recent_local_session_ids(
             for path in (home / "sessions").glob("*/session_*/agents/main/wire.jsonl")
             if path.is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "codex":
         configured_home = os.environ.get("CODEX_HOME")
@@ -256,9 +279,47 @@ def list_recent_local_session_ids(
             session_id = path.stem[-36:]
             if _CODEX_THREAD_ID_RE.fullmatch(session_id):
                 candidates.append((path, session_id))
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     raise ValueError(f"Unsupported import source: {source}")
+
+
+def list_recent_local_session_ids(
+    source: ImportSource,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """List recent parent session ids for one local harness, newest first."""
+    return tuple(sid for sid, _ in _recent_local_sessions_with_recency(source, limit=limit))
+
+
+def _normalize_recency(recency: float) -> float:
+    """Fold millisecond timestamps to seconds so harnesses compare on one scale.
+
+    File-based harnesses use mtime (Unix seconds ~1.7e9); OpenCode reports
+    ``updated`` in epoch millis (~1.7e12). Without this a millis timestamp would
+    always outrank a seconds one in a cross-harness merge.
+    """
+    return recency / 1000.0 if recency > 1e12 else recency
+
+
+def list_recent_sessions_across_harnesses(*, limit: int) -> list[tuple[ImportSource, str]]:
+    """Return the ``limit`` most recent sessions across every harness, newest first.
+
+    Unlike calling :func:`list_recent_local_session_ids` per harness (which would
+    yield ``limit`` *each*), this merges all harnesses into one global recency
+    order and keeps the top ``limit`` — so "last N" means N total. A harness with
+    no history or an unavailable CLI is skipped.
+    """
+    scored: list[tuple[float, ImportSource, str]] = []
+    for source in get_args(ImportSource):
+        try:
+            recent = _recent_local_sessions_with_recency(source, limit=limit)
+        except (SessionImportNotFoundError, OSError, ValueError, TypeError):
+            continue
+        scored.extend((_normalize_recency(recency), source, sid) for sid, recency in recent)
+    scored.sort(key=lambda entry: (entry[0], entry[2]), reverse=True)
+    return [(source, sid) for _, source, sid in scored[:limit]]
 
 
 def _claude_workspace(transcript_path: Path) -> str | None:
