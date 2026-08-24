@@ -75,6 +75,38 @@ async def test_import_session_creates_normal_session_and_blocks_duplicate(
     assert [item["type"] for item in items.json()["data"]] == ["message", "message"]
 
 
+async def test_import_session_uses_native_title_when_supplied(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A supplied harness title becomes the conversation title over the first message."""
+    _seed_claude_agent(db_uri)
+    payload = {
+        "source": "claude",
+        "external_session_id": "claude-titled-1",
+        "title": "My renamed thread",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect TODO.md"}],
+                },
+            }
+        ],
+    }
+
+    created = await client.post("/v1/imports", json=payload)
+
+    assert created.status_code == 201
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(
+        created.json()["session_id"]
+    )
+    assert conversation is not None
+    assert conversation.title == "My renamed thread"
+
+
 async def test_concurrent_identical_imports_return_one_session(
     client: httpx.AsyncClient,
     db_uri: str,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 from hashlib import sha256
 from pathlib import Path
@@ -276,6 +277,39 @@ def _claude_workspace(transcript_path: Path) -> str | None:
     return None
 
 
+def _claude_native_title(transcript_path: Path) -> str | None:
+    """Return Claude Code's own session title, custom name over AI-generated.
+
+    Claude appends ``custom-title`` (user rename) and ``ai-title`` (generated)
+    lines to the JSONL as they change; the last of each wins. A user's rename
+    beats the AI title.
+    """
+    custom: str | None = None
+    ai: str | None = None
+    try:
+        with transcript_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if "-title" not in line:  # cheap prefilter; the type is custom-title / ai-title
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("type") == "custom-title":
+                    value = record.get("customTitle")
+                    if isinstance(value, str) and value.strip():
+                        custom = value.strip()
+                elif record.get("type") == "ai-title":
+                    value = record.get("aiTitle")
+                    if isinstance(value, str) and value.strip():
+                        ai = value.strip()
+    except OSError:
+        return None
+    return custom or ai
+
+
 def load_claude_session(
     session_id: str,
     *,
@@ -312,6 +346,7 @@ def load_claude_session(
         external_session_id=session_id,
         workspace=_claude_workspace(transcript_path),
         items=items,
+        native_title=_claude_native_title(transcript_path),
     )
 
 
@@ -432,6 +467,71 @@ def _find_archived_codex_rollout(codex_home: Path, session_id: str) -> Path | No
     return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
 
 
+def _codex_thread_name_from_index(home: Path, session_id: str) -> str | None:
+    """Return the user's thread rename from ``session_index.jsonl``, if any.
+
+    Renaming a Codex thread appends ``{id, thread_name, updated_at}`` here; it
+    is codex's authoritative rename store and, unlike ``threads.title`` in the
+    state DB, always reflects the rename. Last entry for the id wins.
+    """
+    index = home / "session_index.jsonl"
+    name: str | None = None
+    try:
+        with index.open(encoding="utf-8") as handle:
+            for line in handle:
+                if session_id not in line:  # cheap prefilter before JSON parse
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("id") == session_id:
+                    value = record.get("thread_name")
+                    if isinstance(value, str) and value.strip():
+                        name = value.strip()
+    except OSError:
+        return None
+    return name
+
+
+def _codex_native_title(home: Path, session_id: str) -> str | None:
+    """Return the user's custom Codex thread title, or None if auto-derived.
+
+    A rename lands in ``session_index.jsonl`` (``thread_name``) — the reliable
+    source — so check that first. As a fallback, ``state_<n>.sqlite``'s
+    ``threads.title`` holds the raw first user message until renamed, so only a
+    title that diverges from ``first_user_message`` is a real custom name;
+    otherwise the first-message synthesis is better.
+    """
+    indexed = _codex_thread_name_from_index(home, session_id)
+    if indexed:
+        return indexed
+
+    def _state_db_version(path: Path) -> int:
+        match = re.search(r"state_(\d+)\.sqlite$", path.name)
+        return int(match.group(1)) if match else -1
+
+    dbs = sorted(home.glob("state_*.sqlite"), key=_state_db_version, reverse=True)
+    for db in dbs:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT title, first_user_message FROM threads WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        if row is None:
+            continue
+        title = (row[0] or "").strip()
+        first_message = (row[1] or "").strip()
+        return title if title and title != first_message else None
+    return None
+
+
 def load_codex_session(
     session_id: str,
     *,
@@ -482,6 +582,7 @@ def load_codex_session(
         external_session_id=session_id,
         workspace=workspace,
         items=tuple(items),
+        native_title=_codex_native_title(home, session_id),
     )
 
 
@@ -1189,11 +1290,18 @@ def load_opencode_session(
         )
     workspace_value = info.get("directory") if isinstance(info, dict) else None
     workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
+    # OpenCode auto-generates a session title (info.title); carry it as the
+    # native title instead of synthesizing from the first message.
+    title_value = info.get("title") if isinstance(info, dict) else None
+    native_title = (
+        title_value.strip() if isinstance(title_value, str) and title_value.strip() else None
+    )
     return LocalSessionImport(
         source="opencode",
         external_session_id=session_id,
         workspace=workspace or None,
         items=items,
+        native_title=native_title,
     )
 
 

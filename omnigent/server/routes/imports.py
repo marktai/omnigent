@@ -55,6 +55,7 @@ class ImportSessionRequest(BaseModel):
     source: ImportSource
     external_session_id: str = Field(min_length=1, max_length=128)
     workspace: str | None = Field(default=None, max_length=2048)
+    title: str | None = Field(default=None, max_length=512)
     force: bool = False
     items: list[ImportItemInput] = Field(min_length=1, max_length=100_000)
 
@@ -174,7 +175,7 @@ def create_imports_router(
         try:
             conversation = await asyncio.to_thread(
                 conversation_store.create_conversation,
-                title=title_from_items(items),
+                title=(body.title or "").strip() or title_from_items(items),
                 agent_id=agent_id,
                 workspace=body.workspace,
                 conversation_id=_import_conversation_id(body.source, body.external_session_id),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -209,6 +210,7 @@ def test_load_opencode_session_preserves_messages_files_and_tools(
         "info": {
             "id": "ses_import",
             "directory": "/repo",
+            "title": "OpenCode session title",
             "version": "1.17.18",
         },
         "messages": [
@@ -258,6 +260,8 @@ def test_load_opencode_session_preserves_messages_files_and_tools(
     assert imported.source == "opencode"
     assert imported.external_session_id == "ses_import"
     assert imported.workspace == "/repo"
+    assert imported.native_title == "OpenCode session title"
+    assert imported.title == "OpenCode session title"
     assert [item.type for item in imported.items] == [
         "message",
         "message",
@@ -377,6 +381,72 @@ def test_load_claude_session_normalizes_parent_transcript(tmp_path: Path) -> Non
     ]
     assert imported.items[1].data.model_dump()["call_id"] == "toolu_read_1"
     assert imported.items[3].data.model_dump()["agent"] == "claude-native-ui"
+
+
+def _write_claude_transcript_with_titles(
+    tmp_path: Path,
+    session_id: str,
+    *,
+    ai_title: str | None,
+    custom_title: str | None,
+) -> None:
+    """Write a minimal Claude transcript, optionally stamped with title lines."""
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records: list[dict[str, object]] = [
+        {
+            "type": "user",
+            "uuid": "user-1",
+            "cwd": "/repo",
+            "message": {"role": "user", "content": "inspect TODO.md"},
+        }
+    ]
+    if ai_title is not None:
+        records.append({"type": "ai-title", "aiTitle": ai_title, "sessionId": session_id})
+    if custom_title is not None:
+        records.append(
+            {"type": "custom-title", "customTitle": custom_title, "sessionId": session_id}
+        )
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+
+def test_load_claude_session_prefers_custom_title_over_ai_title(tmp_path: Path) -> None:
+    """A user rename (custom-title) wins over the generated ai-title."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    _write_claude_transcript_with_titles(
+        tmp_path, session_id, ai_title="Generated summary", custom_title="My renamed thread"
+    )
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    assert imported.native_title == "My renamed thread"
+    assert imported.title == "My renamed thread"
+
+
+def test_load_claude_session_falls_back_to_ai_title(tmp_path: Path) -> None:
+    """With no rename, the generated ai-title is used over the first message."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    _write_claude_transcript_with_titles(
+        tmp_path, session_id, ai_title="Generated summary", custom_title=None
+    )
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    assert imported.native_title == "Generated summary"
+    assert imported.title == "Generated summary"
+
+
+def test_load_claude_session_synthesizes_title_without_native(tmp_path: Path) -> None:
+    """No title lines → the title is synthesized from the first user message."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    _write_claude_transcript_with_titles(tmp_path, session_id, ai_title=None, custom_title=None)
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    assert imported.native_title is None
+    assert imported.title == "inspect TODO.md"
 
 
 def test_load_claude_session_rejects_empty_history(tmp_path: Path) -> None:
@@ -554,6 +624,103 @@ def test_load_codex_session_normalizes_response_items(tmp_path: Path) -> None:
         "call_id": "call_2",
         "output": "",
     }
+
+
+def _write_codex_rollout(tmp_path: Path, session_id: str, *, first_message: str) -> None:
+    """Write a minimal importable Codex rollout with one user message."""
+    rollout = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "15"
+        / f"rollout-2026-07-15T12-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    records = [
+        {"type": "session_meta", "payload": {"id": session_id, "cwd": "/repo"}},
+        {"type": "turn_context", "payload": {"turn_id": "turn_1", "cwd": "/repo"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": first_message}],
+            },
+        },
+    ]
+    rollout.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+
+
+def _write_codex_threads_db(
+    tmp_path: Path, session_id: str, *, title: str, first_user_message: str
+) -> None:
+    """Write a codex ``state_5.sqlite`` holding one thread's title metadata."""
+    con = sqlite3.connect(tmp_path / "state_5.sqlite")
+    try:
+        con.execute("CREATE TABLE threads (id TEXT, title TEXT, first_user_message TEXT)")
+        con.execute(
+            "INSERT INTO threads (id, title, first_user_message) VALUES (?, ?, ?)",
+            (session_id, title, first_user_message),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_load_codex_session_uses_custom_thread_title(tmp_path: Path) -> None:
+    """A renamed Codex thread (title != first message) carries its custom name."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    _write_codex_rollout(tmp_path, session_id, first_message="inspect TODO.md")
+    _write_codex_threads_db(
+        tmp_path, session_id, title="my renamed thread", first_user_message="inspect TODO.md"
+    )
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    assert imported.native_title == "my renamed thread"
+    assert imported.title == "my renamed thread"
+
+
+def test_load_codex_session_ignores_auto_thread_title(tmp_path: Path) -> None:
+    """An un-renamed thread (title == first message) synthesizes from items instead."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    _write_codex_rollout(tmp_path, session_id, first_message="inspect TODO.md")
+    _write_codex_threads_db(
+        tmp_path, session_id, title="inspect TODO.md", first_user_message="inspect TODO.md"
+    )
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    assert imported.native_title is None
+    assert imported.title == "inspect TODO.md"
+
+
+def test_load_codex_session_uses_session_index_rename(tmp_path: Path) -> None:
+    """A rename lives in session_index.jsonl even when threads.title still lags.
+
+    Renaming a Codex thread records ``thread_name`` in ``session_index.jsonl``
+    while ``threads.title`` can keep the original first message — so the index
+    must win.
+    """
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    _write_codex_rollout(tmp_path, session_id, first_message="inspect TODO.md")
+    _write_codex_threads_db(
+        tmp_path, session_id, title="inspect TODO.md", first_user_message="inspect TODO.md"
+    )
+    # An earlier auto entry, then the user's rename — last entry for the id wins.
+    (tmp_path / "session_index.jsonl").write_text(
+        json.dumps({"id": session_id, "thread_name": "inspect TODO.md"})
+        + "\n"
+        + json.dumps({"id": session_id, "thread_name": "my-renamed-thread"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    assert imported.native_title == "my-renamed-thread"
+    assert imported.title == "my-renamed-thread"
 
 
 def test_load_codex_session_finds_archived_rollout(tmp_path: Path) -> None:
