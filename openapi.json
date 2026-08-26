@@ -2233,6 +2233,18 @@
             "title": "Source",
             "type": "string"
           },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
           "workspace": {
             "anyOf": [
               {
