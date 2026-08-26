@@ -8,7 +8,7 @@ import secrets
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, Literal, get_args
+from typing import Any, Literal, cast, get_args
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, Field, field_validator
@@ -405,6 +405,10 @@ def create_imports_router(
             ):
                 failed += 1
                 continue
+            # The guard above rejected None and anything outside valid_sources
+            # (get_args(ImportSource), which excludes "all"), so this is a
+            # concrete harness — narrow off the request's ImportSource | "all".
+            source = cast(ImportSource, source)
             existing = await asyncio.to_thread(
                 conversation_store.find_imported_conversation,
                 source,
