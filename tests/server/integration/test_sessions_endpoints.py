@@ -6624,6 +6624,46 @@ async def test_post_external_permission_mode_change_persists_label_and_publishes
     assert published[0][1]["permission_mode"] == "auto"
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "auto"
+    # This session launched without an explicit --permission-mode, so the footer
+    # report must NOT pin one (that would override its settings default on
+    # relaunch); the label alone carries the mode for the web picker.
+    assert snapshot["terminal_launch_args"] is None
+
+
+async def test_post_external_permission_mode_change_rewrites_launch_arg(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A pane switch replaces the create-time ``--permission-mode`` launch arg.
+
+    A session created in one mode keeps that mode in ``terminal_launch_args``;
+    when the user cycles to another mode with shift+tab, the stored launch args
+    must carry the NEW mode (other args untouched) so a cold resume reopens in
+    it rather than the create-time mode.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=["--model", "opus", "--permission-mode", "plan"],
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": "acceptEdits"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == [
+        "--model",
+        "opus",
+        "--permission-mode",
+        "acceptEdits",
+    ]
 
 
 async def test_post_external_permission_mode_change_is_quiet_when_unchanged(
@@ -8407,9 +8447,73 @@ async def test_patch_permission_mode_persists_label_and_forwards_event(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "auto"
+    # No launch --permission-mode to rewrite, so none is fabricated (see the
+    # rewrite-existing test below for the persist-to-launch-args case).
+    assert resp.json()["terminal_launch_args"] is None
     forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
     assert len(forwards) == 1, f"Expected one runner forward, got {captured!r}"
     assert forwards[0].body == {"type": "permission_mode_change", "permission_mode": "auto"}
+
+
+async def test_patch_permission_mode_rewrites_launch_arg_and_keeps_other_args(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A combined PATCH rewrites the launch --permission-mode and keeps other args.
+
+    Guards two things: the confirmed mode replaces an existing launch
+    ``--permission-mode`` (so a relaunch reopens in it), and merging against the
+    freshly written row — not the pre-update snapshot — means a PATCH that also
+    sets ``terminal_launch_args`` keeps the caller's other args (here
+    ``--model sonnet``) rather than reverting to the pre-PATCH launch args.
+    """
+    from omnigent.runtime import set_runner_client
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Echo the switched mode like the claude-native runner handler."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        return httpx.Response(200, json={"permission_mode": "acceptEdits"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+            terminal_launch_args=["--model", "opus", "--permission-mode", "plan"],
+        )
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={
+                "permission_mode": "acceptEdits",
+                # Same request also replaces the launch args wholesale.
+                "terminal_launch_args": ["--model", "sonnet", "--permission-mode", "plan"],
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    # The PATCH's --model sonnet survives, and --permission-mode is rewritten to
+    # the runner-confirmed mode (not the pre-PATCH --model opus / plan).
+    assert resp.json()["terminal_launch_args"] == [
+        "--model",
+        "sonnet",
+        "--permission-mode",
+        "acceptEdits",
+    ]
+    assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "acceptEdits"
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
