@@ -98,6 +98,15 @@ def test_import_local_frames_round_trip() -> None:
     )
     assert isinstance(done, HostImportLocalDoneFrame)
     assert done.status == "ok" and done.error is None
+    assert done.failed == 0
+
+    # The done frame carries the host-side unreadable count so the server's
+    # tally covers sessions that never produced a frame.
+    done_failed = decode_host_frame(
+        encode_host_frame(HostImportLocalDoneFrame(request_id="req_imp", status="ok", failed=2))
+    )
+    assert isinstance(done_failed, HostImportLocalDoneFrame)
+    assert done_failed.failed == 2
 
 
 def test_model_options_frames_round_trip() -> None:

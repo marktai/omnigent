@@ -2942,8 +2942,9 @@ export function NewChatLandingScreen() {
   // which have no knobs to remember.
   const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
 
-  // Empty-landing one-click: import the last 50 sessions across all harnesses
-  // from the caller's online machine (prefer the selected one). With no online
+  // Empty-landing one-click: import the last LANDING_QUICK_IMPORT_LIMIT sessions
+  // across all harnesses from the caller's online machine (prefer the selected
+  // one). With no online
   // host there's nothing to read from, so send them to the Settings import
   // section for the granular picker + its "start a host" guidance.
   const handleQuickImport = async (): Promise<void> => {

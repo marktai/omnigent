@@ -760,7 +760,12 @@ async def _receive_loop(
         if isinstance(frame, HostImportLocalDoneFrame):
             queue = conn.pending_import_local.get(frame.request_id)
             if queue is not None:
-                queue.put_nowait(("done", {"status": frame.status, "error": frame.error}))
+                queue.put_nowait(
+                    (
+                        "done",
+                        {"status": frame.status, "error": frame.error, "failed": frame.failed},
+                    )
+                )
             continue
 
         _logger.debug(

@@ -270,6 +270,37 @@ async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
     assert conn.pending_import_local == {}
 
 
+async def test_stream_local_sessions_surfaces_host_failed_count() -> None:
+    """The done frame's host-side unreadable count is exposed via ``stats``.
+
+    Sessions the host enumerated but could not read send no session frame, only
+    a count on the done frame; the consumer must surface it so the route folds
+    it into ``failed`` instead of the batch silently under-reporting.
+    """
+    conn = SimpleNamespace(host_id="h1", pending_import_local={})
+
+    class _Reg:
+        def send_text(self, host_conn: object, frame: str) -> None:
+            (queue,) = conn.pending_import_local.values()
+            queue.put_nowait(("done", {"status": "ok", "error": None, "failed": 3}))
+
+    stats: dict[str, int] = {}
+    got = [
+        session
+        async for session in _stream_local_sessions_from_host(
+            host_registry=_Reg(),  # type: ignore[arg-type]
+            host_conn=conn,  # type: ignore[arg-type]
+            source="all",
+            limit=5,
+            stats=stats,
+        )
+    ]
+
+    assert got == []
+    assert stats["host_failed"] == 3
+    assert conn.pending_import_local == {}
+
+
 async def test_stream_local_sessions_raises_on_failed_done() -> None:
     """A ``done`` frame with status='failed' surfaces the host's error, not a hang."""
     conn = SimpleNamespace(host_id="h1", pending_import_local={})

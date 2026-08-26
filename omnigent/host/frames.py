@@ -931,11 +931,15 @@ class HostImportLocalDoneFrame:
     :param request_id: Correlates to the :class:`HostImportLocalFrame`.
     :param status: ``"ok"`` or ``"failed"``.
     :param error: Failure detail when ``status`` is ``"failed"``.
+    :param failed: Count of enumerated sessions the host could not read/parse
+        (skipped, no session frame sent). The server folds these into its own
+        failed tally so the reported counts account for every target.
     """
 
     request_id: str
     status: str
     error: str | None = None
+    failed: int = 0
 
 
 HostFrame = (
@@ -1367,6 +1371,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "error": frame.error,
+                "failed": frame.failed,
             }
         )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
@@ -2070,6 +2075,8 @@ def _decode_import_local_done(msg: _JsonObject) -> HostImportLocalDoneFrame:
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         error=_optional_nullable_str(msg, "error"),
+        # Absent on older hosts; default to 0 so decode stays backward-compatible.
+        failed=raw_failed if isinstance(raw_failed := msg.get("failed"), int) else 0,
     )
 
 

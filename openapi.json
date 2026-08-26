@@ -8849,7 +8849,7 @@
     },
     "/v1/imports/local": {
       "post": {
-        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported. Drives the web \"Import sessions\"\nbutton.",
+        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported. Drives the web \"Import sessions\"\nbutton.\n\nNot atomic: each session is persisted as its frame arrives. If the host\ndrops mid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
         "operationId": "import_local_sessions_v1_imports_local_post",
         "requestBody": {
           "content": {

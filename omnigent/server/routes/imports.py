@@ -34,6 +34,10 @@ from omnigent.stores.conversation_store import ConversationAlreadyExistsError
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 
+# Upper bound on items in one imported session, shared by the CLI-normalized
+# ``/imports`` body and the host-streamed ``/imports/local`` path.
+_MAX_IMPORT_ITEMS = 100_000
+
 
 class ImportItemInput(BaseModel):
     """One normalized existing Omnigent item received from the CLI."""
@@ -62,7 +66,7 @@ class ImportSessionRequest(BaseModel):
     workspace: str | None = Field(default=None, max_length=2048)
     title: str | None = Field(default=None, max_length=512)
     force: bool = False
-    items: list[ImportItemInput] = Field(min_length=1, max_length=100_000)
+    items: list[ImportItemInput] = Field(min_length=1, max_length=_MAX_IMPORT_ITEMS)
 
     @field_validator("external_session_id")
     @classmethod
@@ -164,6 +168,7 @@ async def _stream_local_sessions_from_host(
     host_conn: HostConnection,
     source: str,
     limit: int,
+    stats: dict[str, int] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield the host's recent local sessions one at a time as they stream in.
 
@@ -207,6 +212,10 @@ async def _stream_local_sessions_from_host(
                         data.get("error") or "host failed to read local sessions",
                         code=ErrorCode.INTERNAL_ERROR,
                     )
+                # Sessions the host enumerated but couldn't read send no frame;
+                # surface their count so the caller's tally covers every target.
+                if stats is not None:
+                    stats["host_failed"] = int(data.get("failed") or 0)
                 return
     finally:
         host_conn.pending_import_local.pop(request_id, None)
@@ -347,7 +356,11 @@ def create_imports_router(
             item_count=len(items),
         )
 
-    @router.post("/imports/local", response_model=LocalImportResponse)
+    @router.post(
+        "/imports/local",
+        response_model=LocalImportResponse,
+        dependencies=[Depends(require_json_content_type)],
+    )
     async def import_local_sessions(
         body: LocalImportRequest,
         request: Request,
@@ -359,6 +372,10 @@ def create_imports_router(
         host enumerates + normalizes the most recent sessions; the server
         imports those not already imported. Drives the web "Import sessions"
         button.
+
+        Not atomic: each session is persisted as its frame arrives. If the host
+        drops mid-stream this raises after the sessions read so far are already
+        committed; a retry is idempotent (they come back as already-imported).
         """
         if host_registry is None or host_store is None:
             raise OmnigentError(
@@ -382,6 +399,9 @@ def create_imports_router(
         already_imported = 0
         failed = 0
         sessions: list[ImportedSessionRef] = []
+        # Set by the stream to the count of sessions the host couldn't read (no
+        # frame arrives for them); folded into ``failed`` after the loop.
+        stats: dict[str, int] = {}
         # Persist each session as it streams in from the host (one frame each),
         # rather than buffering the whole batch.
         async for session in _stream_local_sessions_from_host(
@@ -389,6 +409,7 @@ def create_imports_router(
             host_conn=host_conn,
             source=body.source,
             limit=body.limit,
+            stats=stats,
         ):
             external_session_id = session.get("external_session_id")
             raw_items = session.get("items")
@@ -402,6 +423,9 @@ def create_imports_router(
                 not isinstance(external_session_id, str)
                 or not isinstance(raw_items, list)
                 or source is None
+                # Mirror the /imports item cap so one oversized transcript can't
+                # balloon a batch import's memory.
+                or len(raw_items) > _MAX_IMPORT_ITEMS
             ):
                 failed += 1
                 continue
@@ -434,6 +458,9 @@ def create_imports_router(
                 continue
             imported += 1
             sessions.append(ImportedSessionRef(session_id=session_id, title=title))
+        # Fold in sessions the host enumerated but couldn't read, so the counts
+        # account for every target the user asked to import.
+        failed += stats.get("host_failed", 0)
         return LocalImportResponse(
             imported=imported,
             already_imported=already_imported,

@@ -2003,9 +2003,13 @@ class HostProcess:
             # Oldest first so the server imports newest last → newest sits atop the sidebar.
             ordered = list(reversed(targets))
             total = len(ordered)
+            load_failed = 0
             for source, session_id in ordered:
                 session = await asyncio.to_thread(_load, source, session_id)
                 if session is None:
+                    # Unreadable/corrupt transcript: no frame to send, but report
+                    # it on the done frame so the server's counts stay honest.
+                    load_failed += 1
                     continue
                 await ws.send(
                     encode_host_frame(
@@ -2016,7 +2020,9 @@ class HostProcess:
                 )
             await ws.send(
                 encode_host_frame(
-                    HostImportLocalDoneFrame(request_id=frame.request_id, status="ok")
+                    HostImportLocalDoneFrame(
+                        request_id=frame.request_id, status="ok", failed=load_failed
+                    )
                 )
             )
         except ConnectionClosed:
