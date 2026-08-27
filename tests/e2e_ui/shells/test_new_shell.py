@@ -95,7 +95,7 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
     expect(page.locator('[data-testid="main-terminal-view"][data-visible="true"]')).to_have_count(
         0
     )
-    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
 
     # The tab's x asks to confirm first (closing a tab kills the terminal);
     # confirming unmounts the shell's xterm and the rail returns to its
