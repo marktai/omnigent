@@ -317,3 +317,22 @@ def test_args_alias_canonicalized() -> None:
 
 def test_args_no_config_layer() -> None:
     assert resolve_harness_args("codex", ("--verbose",), cfg=None) == ["--verbose"]
+
+
+# ── isaac wrapper shape (the runner auto-create's contract) ──────────
+# The runner's native terminal auto-create resolves command+args through the
+# resolvers above; these pin the exact `isaac -- <args>` / `isaac codex --
+# <args>` shape a downstream integration configures. The config `args` base
+# prepends before Omnigent's already-augmented args, so the `--` stays first.
+def test_isaac_wrap_shape_claude_native() -> None:
+    cfg = {"harness": {"claude-native": {"command": "isaac", "args": ["--"]}}}
+    assert resolve_harness_command("claude-native", default="claude", cfg=cfg) == "isaac"
+    built = ("--model", "x", "--mcp-config", "{}")
+    assert resolve_harness_args("claude-native", built, cfg=cfg) == ["--", *built]
+
+
+def test_isaac_wrap_shape_codex_native() -> None:
+    cfg = {"harness": {"codex-native": {"command": "isaac", "args": ["codex", "--"]}}}
+    assert resolve_harness_command("codex-native", default="codex", cfg=cfg) == "isaac"
+    built = ("--remote", "ws://127.0.0.1:9876")
+    assert resolve_harness_args("codex-native", built, cfg=cfg) == ["codex", "--", *built]
