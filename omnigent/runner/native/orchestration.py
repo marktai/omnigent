@@ -4226,46 +4226,63 @@ async def _auto_create_codex_terminal(
     # background task adopts it. Resume sessions pass the persisted
     # external_session_id so the runner-owned TUI reopens the existing
     # app-server thread.
-    codex_remote_args = build_codex_remote_args(
-        codex_args=tuple(launch_config.terminal_launch_args or ()),
-        thread_id=launch_config.external_session_id,
-        remote_url=codex_ws_url,
-        bypass_sandbox=launch_config.bypass_sandbox,
-        # The --remote TUI loads its own config and does not inherit the
-        # app-server's -c flags; pass the same provider/model overrides so it
-        # resolves the Omnigent provider instead of falling back to the OpenAI
-        # built-in (which would force the first-run login screen and block
-        # thread creation).
-        config_overrides=tuple(app_server.config_overrides),
-        # Omnigent provisions the private CODEX_HOME and vets hook sources
-        # itself; skip the interactive trust prompt that headless sub-agents
-        # can never answer.
-        #
-        # A failed version probe must not restore the interactive gate:
-        # Omnigent's supported Codex floor is newer than the release that added
-        # this flag. Otherwise a transient ``codex --version`` failure strands
-        # the queued web message behind the terminal-only review screen.
-        bypass_hook_trust=(
-            app_server.codex_cli_version is None
-            or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
-        ),
-    )
-    # Apply the per-harness startup command/args override from config
-    # (``harness.codex-native.{command,args}``) so a downstream integration can
-    # wrap this launch — e.g. Databricks' ``isaac`` sets ``command: isaac`` +
-    # ``args: ["codex", "--"]`` to run ``isaac codex -- <remote args>``. Identity
-    # by default; the same resolver the local-CLI codex launch uses.
-    from omnigent.config import load_effective_config
-    from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
-
-    _codex_harness_cfg = load_effective_config()
-    codex_command = resolve_harness_command(
-        "codex-native", default=app_server.codex_path, cfg=_codex_harness_cfg
-    )
-    codex_launch_args = resolve_harness_args(
-        "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
-    )
+    # The app-server and event client are live by this point, so the pre-launch
+    # setup (arg build + config resolve) shares the terminal launch's teardown
+    # below: a raise here must still close them and drop the
+    # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
     try:
+        codex_remote_args = build_codex_remote_args(
+            codex_args=tuple(launch_config.terminal_launch_args or ()),
+            thread_id=launch_config.external_session_id,
+            remote_url=codex_ws_url,
+            bypass_sandbox=launch_config.bypass_sandbox,
+            # The --remote TUI loads its own config and does not inherit the
+            # app-server's -c flags; pass the same provider/model overrides so it
+            # resolves the Omnigent provider instead of falling back to the OpenAI
+            # built-in (which would force the first-run login screen and block
+            # thread creation).
+            config_overrides=tuple(app_server.config_overrides),
+            # Omnigent provisions the private CODEX_HOME and vets hook sources
+            # itself; skip the interactive trust prompt that headless sub-agents
+            # can never answer.
+            #
+            # A failed version probe must not restore the interactive gate:
+            # Omnigent's supported Codex floor is newer than the release that added
+            # this flag. Otherwise a transient ``codex --version`` failure strands
+            # the queued web message behind the terminal-only review screen.
+            bypass_hook_trust=(
+                app_server.codex_cli_version is None
+                or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+            ),
+        )
+        # Apply the per-harness startup command/args override from config
+        # (``harness.codex-native.{command,args}``) so a downstream integration
+        # can wrap this launch — e.g. Databricks' ``isaac`` sets ``command:
+        # isaac`` + ``args: ["codex", "--"]`` to run ``isaac codex -- <remote
+        # args>``. Identity by default; the runner is the single args merge
+        # point (the CLI persists raw pass-through, see cli_native).
+        from omnigent.config import load_effective_config  # noqa: FlagLocalImports
+        from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+            resolve_harness_args,
+            resolve_harness_config,
+        )
+
+        _codex_harness_cfg = load_effective_config()
+        # Config-only command resolve: the managed host provisions
+        # ``app_server.codex_path`` (the vetted binary), so a stray
+        # ``OMNIGENT_CODEX_PATH`` in the runner env must not silently replace it.
+        # A config ``command`` (isaac's wrapper) still applies; env path
+        # overrides are deliberately not consulted on this managed-host path.
+        _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
+        _codex_cmd_override = (_codex_overrides.get("codex-native") or {}).get("command")
+        codex_command = (
+            _codex_cmd_override.strip()
+            if isinstance(_codex_cmd_override, str) and _codex_cmd_override.strip()
+            else app_server.codex_path
+        )
+        codex_launch_args = resolve_harness_args(
+            "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
+        )
         terminal_view = await resource_registry.launch_auxiliary_terminal(
             session_id=session_id,
             terminal_name="codex",
@@ -6874,8 +6891,11 @@ async def _auto_create_claude_terminal(
     # appended above, so the ``--`` stays first). Identity by default. This is
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
     # both terminal-creation paths honour one config surface.
-    from omnigent.config import load_effective_config
-    from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
+    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
+    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+        resolve_harness_args,
+        resolve_harness_command,
+    )
 
     _harness_cfg = load_effective_config()
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
