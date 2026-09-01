@@ -6175,11 +6175,9 @@ def import_session_command(
             target = futures[future]
             results[target] = future.result()
 
-    # A network failure is fatal for the whole batch, matching the serial import.
-    unreachable = next((r for r in results.values() if r.status == "unreachable"), None)
-    if unreachable is not None:
-        raise click.ClickException(unreachable.message or "Could not reach the Omnigent server")
-
+    # A per-session network failure (e.g. one large session's read timeout) is
+    # reported and counted like any other failure so the rest of the batch still
+    # imports; only the single-session path treats unreachable as fatal.
     imported_count = 0
     already_imported_count = 0
     failed_count = 0
