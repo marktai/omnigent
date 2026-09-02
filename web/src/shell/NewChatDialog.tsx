@@ -248,7 +248,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
-import { createBundledSession, importLocalSessions, launchRunner } from "@/lib/sessionsApi";
+import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -2015,10 +2015,6 @@ export function resetLandingDraft(): void {
   landingDraft = null;
 }
 
-// Sessions the empty-landing one-click import pulls (most recent, across all
-// harnesses). Named in the button so the count is explicit before clicking.
-const LANDING_QUICK_IMPORT_LIMIT = 25;
-
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -2099,20 +2095,6 @@ export function NewChatLandingScreen() {
   const hasNoSessions =
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
-  // One-click quick import for the empty landing: pull the recent sessions
-  // across every harness on the caller's online machine.
-  const [quickImporting, setQuickImporting] = useState(false);
-  const [quickImportError, setQuickImportError] = useState<string | null>(null);
-  const [quickImportedCount, setQuickImportedCount] = useState<number | null>(null);
-  // The server persists each session as its frame arrives, so refresh the
-  // sidebar list every 5s while importing — sessions show up as they land.
-  useEffect(() => {
-    if (!quickImporting) return;
-    const id = setInterval(() => {
-      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-    }, 5000);
-    return () => clearInterval(id);
-  }, [quickImporting, queryClient]);
 
   const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
 
@@ -2939,29 +2921,6 @@ export function NewChatLandingScreen() {
   // which have no knobs to remember.
   const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
 
-  // Empty-landing one-click: import the last LANDING_QUICK_IMPORT_LIMIT sessions
-  // across all harnesses from the caller's online machine (prefer the selected
-  // one). With no online
-  // host there's nothing to read from, so send them to the Settings import
-  // section for the granular picker + its "start a host" guidance.
-  const handleQuickImport = async (): Promise<void> => {
-    const host = selectedHost?.status === "online" ? selectedHost : onlineHosts[0];
-    if (host === undefined) {
-      navigate("/settings/import");
-      return;
-    }
-    setQuickImporting(true);
-    setQuickImportError(null);
-    try {
-      const result = await importLocalSessions(host.host_id, "all", LANDING_QUICK_IMPORT_LIMIT);
-      setQuickImportedCount(result.imported);
-      await queryClient.invalidateQueries({ queryKey: ["conversations"] });
-    } catch (e) {
-      setQuickImportError(e instanceof Error ? e.message : "Import failed. Try again.");
-    } finally {
-      setQuickImporting(false);
-    }
-  };
   // Warn-only readiness signal for the agent picker: only meaningful when
   // a connected host is selected (a sandbox provisions its own tooling).
   // Selection stays allowed — the host re-checks at launch and the create
@@ -5676,33 +5635,11 @@ export function NewChatLandingScreen() {
           <div className="flex flex-col items-center gap-2">
             <Button
               variant="outline"
-              loading={quickImporting}
-              onClick={() => void handleQuickImport()}
-              data-testid="landing-quick-import"
+              onClick={() => navigate("/settings/import")}
+              data-testid="landing-import-sessions"
             >
-              Import your {LANDING_QUICK_IMPORT_LIMIT} most recent sessions
+              Import your recent sessions
             </Button>
-            {quickImportedCount !== null ? (
-              <p
-                className="text-sm text-muted-foreground"
-                data-testid="landing-quick-import-result"
-              >
-                Imported {quickImportedCount} session{quickImportedCount === 1 ? "" : "s"}.
-              </p>
-            ) : quickImportError !== null ? (
-              <p className="text-sm text-destructive" data-testid="landing-quick-import-error">
-                {quickImportError}
-              </p>
-            ) : (
-              <button
-                type="button"
-                onClick={() => navigate("/settings/import")}
-                className="text-xs text-muted-foreground underline underline-offset-2 transition-colors hover:text-foreground hover:no-underline"
-                data-testid="landing-import-sessions"
-              >
-                Choose what to import
-              </button>
-            )}
           </div>
         ) : null}
       </div>
