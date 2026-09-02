@@ -27,6 +27,9 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from omnigent.codex_approval_modes import (
+    CODEX_NATIVE_PERMISSION_VALUES,
+)
 from omnigent.cost_plan import (
     reserved_cost_control_keys,
 )
@@ -102,6 +105,7 @@ from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+    _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
@@ -131,12 +135,14 @@ from omnigent.server.routes._sessions.helpers import (
     _permission_level_from_grants,
     _presentation_labels_for_agent,
     _prune_session_read_state,
+    _publish_codex_approval_mode,
     _publish_collaboration_mode,
     _publish_permission_mode,
     _publish_sandbox_status,
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
+    _require_codex_approval_mode_forward,
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
@@ -1763,6 +1769,34 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             requested_claude_permission_mode = body.permission_mode
+        approval_mode_requested = "approval_mode" in body.model_fields_set
+        requested_codex_approval_mode: str | None = None
+        if approval_mode_requested:
+            if body.approval_mode is None:
+                raise OmnigentError(
+                    "approval_mode must be a non-empty string",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if body.approval_mode not in CODEX_NATIVE_PERMISSION_VALUES:
+                raise OmnigentError(
+                    f"approval_mode must be one of {sorted(CODEX_NATIVE_PERMISSION_VALUES)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            conv_for_approval_mode = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                session_id,
+            )
+            if conv_for_approval_mode is None:
+                raise _session_not_found()
+            if (
+                conv_for_approval_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                != _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+            ):
+                raise OmnigentError(
+                    "approval_mode is only supported for codex-native sessions",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            requested_codex_approval_mode = body.approval_mode
         labels_to_set = dict(body.labels or {})
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
@@ -2074,6 +2108,25 @@ def register_core_routes(
                     session_id,
                     terminal_launch_args=_merged_permission_args,
                 )
+        if requested_codex_approval_mode is not None and live_forward:
+            _approval_result = await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {
+                    "type": "codex_approval_mode_change",
+                    "approval_mode": requested_codex_approval_mode,
+                },
+            )
+            # Raises unless the runner drove the /permissions popup, so the label
+            # can never claim a preset the Codex TUI wasn't switched to. Codex owns
+            # the durable approval state (its own session config); the label is the
+            # web read-back only, so there is no terminal_launch_args coupling here.
+            _require_codex_approval_mode_forward(
+                session_id,
+                requested_codex_approval_mode,
+                _approval_result,
+            )
+            labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before
@@ -2093,6 +2146,11 @@ def register_core_routes(
             _publish_permission_mode(
                 session_id,
                 labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY],
+            )
+        if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_set:
+            _publish_codex_approval_mode(
+                session_id,
+                labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY],
             )
         # Archiving means "get this out of my way", which contradicts a pin
         # ("keep it at the top"), so drop the archiver's own pin — otherwise the

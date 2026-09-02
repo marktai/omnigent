@@ -225,6 +225,10 @@ import {
   claudePermissionModeLabel,
   isClaudeNativeSession,
 } from "@/lib/claudePermissionMode";
+import {
+  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+  codexApprovalModeLabel,
+} from "@/lib/codexApprovalMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
@@ -1388,6 +1392,7 @@ export function ChatPage() {
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
+      showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
@@ -1632,6 +1637,7 @@ interface MainAgentSurfaceProps {
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -1777,6 +1783,7 @@ function MainAgentSurface({
   codexModelOptions,
   showCodexPlanMode,
   showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -2319,6 +2326,7 @@ function MainAgentSurface({
             codexModelOptions={codexModelOptions}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
+            showCodexApprovalMode={showCodexApprovalMode}
             showGoalControl={showGoalControl}
             showClaudeGoalControl={showClaudeGoalControl}
             showPollyCodexGoalControl={showPollyCodexGoalControl}
@@ -3760,6 +3768,7 @@ interface ComposerProps {
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -4372,6 +4381,7 @@ export function Composer({
   codexModelOptions,
   showCodexPlanMode,
   showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -5650,6 +5660,7 @@ export function Composer({
                 showModels={showModels}
                 showEffort={showEffort}
                 showClaudePermissionMode={showClaudePermissionMode}
+                showCodexApprovalMode={showCodexApprovalMode}
                 effortLevels={effortLevels}
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
@@ -6096,6 +6107,22 @@ export function shouldShowClaudePermissionModeControl(
 }
 
 /**
+ * True when the codex-native approval-mode picker should be visible.
+ *
+ * Codex-native sessions only: the switch drives Codex's own approval/sandbox
+ * presets (the ``/permissions`` popup), which no other harness has.
+ *
+ * :param conv: Session-like object carrying `labels`; a missing session or
+ *     missing labels fails closed.
+ * :returns: True only for sessions running the codex-native wrapper.
+ */
+export function shouldShowCodexApprovalModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isCodexNativeSession(conv);
+}
+
+/**
  * True when the session Goal control should be visible.
  *
  * @param conv - Session or sidebar row carrying labels. ``null`` or missing
@@ -6161,6 +6188,7 @@ function SessionConfigModal({
   showModels,
   showEffort,
   showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -6173,6 +6201,7 @@ function SessionConfigModal({
   showModels: boolean;
   showEffort: boolean;
   showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -6181,6 +6210,7 @@ function SessionConfigModal({
 }) {
   const selectedEffort = useSessionEffort();
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
+  const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -6211,6 +6241,12 @@ function SessionConfigModal({
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
   const [draftPermissionMode, setDraftPermissionMode] = useState(claudePermissionMode);
+  const [draftApprovalMode, setDraftApprovalMode] = useState(codexApprovalMode);
+  // Unlike the other drafts (snapshot-on-open), the approval picker must track
+  // live store changes while the modal stays open — a /permissions change in
+  // the TUI republishes the mode via SSE. This flags a user pick so the resync
+  // effect below stops mirroring once they've started editing.
+  const approvalTouchedRef = useRef(false);
   // The sub-agent row is stored as a PICK, not a pre-seeded draft:
   // `undefined` means "untouched", so the row mirrors the live stored value for
   // as long as the user hasn't chosen anything. A draft seeded once per open
@@ -6226,6 +6262,8 @@ function SessionConfigModal({
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
     setDraftPermissionMode(claudePermissionMode);
+    setDraftApprovalMode(codexApprovalMode);
+    approvalTouchedRef.current = false;
     setPickedSubagentRouting(undefined);
     // Nothing pushes a routing-switch change to the client (no SSE event, and
     // the session query never goes stale), so re-read them here — otherwise the
@@ -6235,6 +6273,12 @@ function SessionConfigModal({
     // session changes under an open modal (its drafts describe the old one).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, conversationId]);
+
+  // Follow live approval-mode changes while the modal is open (a TUI
+  // /permissions switch republishes via SSE), until the user picks here.
+  useEffect(() => {
+    if (open && !approvalTouchedRef.current) setDraftApprovalMode(codexApprovalMode);
+  }, [open, codexApprovalMode]);
 
   // The Select value: the router sentinel when routing is drafted on, else the
   // drafted model, else the "Default" sentinel (no override).
@@ -6336,6 +6380,10 @@ function SessionConfigModal({
         // sequence rather than firing concurrently.
         if (showClaudePermissionMode && draftPermissionMode !== claudePermissionMode)
           await store.setClaudePermissionMode(draftPermissionMode);
+        // Codex approval switch drives Codex's own /permissions popup on the
+        // runner — same awaited sequence so it can't race the others.
+        if (showCodexApprovalMode && draftApprovalMode !== codexApprovalMode)
+          await store.setCodexApprovalMode(draftApprovalMode);
         // Sub-agent routing is independent of this session's own model — a
         // plain PATCH with no slash-command injection, so ordering is free.
         // Only an explicit pick is written, and only when it still differs from
@@ -6481,6 +6529,43 @@ function SessionConfigModal({
               </Select>
             </ConfigRow>
           )}
+          {showCodexApprovalMode && (
+            <ConfigRow label="Approvals" description="How much Codex asks before acting">
+              {/* Drives Codex's own /permissions popup by keystroke injection,
+                  so the options mirror it exactly. An empty draft (no switch
+                  seen yet) reads as the placeholder rather than a guessed
+                  default. */}
+              <Select
+                value={draftApprovalMode}
+                onValueChange={(v) => {
+                  approvalTouchedRef.current = true;
+                  setDraftApprovalMode(v);
+                }}
+                componentId="chat.composer.codex_approval_mode"
+                valueHasNoPii
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-approval-mode"
+                  aria-label="Approval mode"
+                >
+                  <SelectValue placeholder="Set in Codex">
+                    {codexApprovalModeLabel(draftApprovalMode) || undefined}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS.map((mode) => (
+                    <SelectItem key={mode.value} value={mode.value} data-approval-mode={mode.value}>
+                      <span className="flex flex-col items-start">
+                        <span>{mode.label}</span>
+                        <span className="text-muted-foreground text-xs">{mode.description}</span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
           {/* Sub-agent routing — the only in-session routing control, for a
           native session whose launch installed the spawn-routing apparatus
           (spawns route through the harness hook) and for SDK/bundle agents
@@ -6550,6 +6635,7 @@ function ComposerConfigGear({
   showModels,
   showEffort,
   showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -6562,6 +6648,7 @@ function ComposerConfigGear({
   showModels: boolean;
   showEffort: boolean;
   showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -6595,7 +6682,8 @@ function ComposerConfigGear({
     !showEffort &&
     !costRoutingEligible &&
     !subagentRoutingEligible &&
-    !showClaudePermissionMode
+    !showClaudePermissionMode &&
+    !showCodexApprovalMode
   )
     return null;
 
@@ -6654,6 +6742,7 @@ function ComposerConfigGear({
         showModels={showModels}
         showEffort={showEffort}
         showClaudePermissionMode={showClaudePermissionMode}
+        showCodexApprovalMode={showCodexApprovalMode}
         effortLevels={effortLevels}
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
