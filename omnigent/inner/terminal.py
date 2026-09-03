@@ -83,7 +83,7 @@ def _tmux_command_sequence(commands: list[list[str]]) -> list[str]:
     file.
 
     :param commands: Tmux commands without the leading ``tmux`` argv,
-        e.g. ``[["set-option", "-g", "mouse", "off"], ["new-session"]]``.
+        e.g. ``[["set-option", "-g", "mouse", "on"], ["new-session"]]``.
     :returns: Flattened argv suffix with command separators.
     """
     sequence: list[str] = []
@@ -167,9 +167,15 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
 
     ``history-limit`` is generated per terminal because it comes from
     ``TerminalEnvSpec.scrollback``. ``set-clipboard external`` exports tmux
-    copy-mode selections without trusting pane OSC 52 requests. ``mouse off``
-    leaves scrolling and text selection to the attached terminal instead of
-    tmux copy mode. ``focus-events on`` lets interactive programs observe pane
+    copy-mode selections without trusting pane OSC 52 requests. ``mouse on``
+    lets a native ``tmux attach`` client reach tmux scrollback with the wheel;
+    tmux's ``WheelUpPane`` binding forwards the wheel to the pane program when
+    it tracks the mouse (``mouse_any_flag``, e.g. a full-screen TUI) and only
+    scrolls tmux history for panes that don't (inline CLIs, shells). It does
+    not affect the web control-mode client, whose xterm owns scrollback. The
+    cost is that plain click-drag selection on a non-tracking pane goes to tmux
+    copy mode, so native selection uses Shift-drag / Option-drag.
+    ``focus-events on`` lets interactive programs observe pane
     focus changes. ``extended-keys`` with CSI-u formatting
     lets programs inside tmux receive Kitty Keyboard Protocol keys such
     as Shift+Enter when the attached terminal supports them. Terminals
@@ -188,7 +194,7 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
         # Export tmux copy-mode selections to attached terminals without letting
         # pane applications create tmux buffers through OSC 52.
         ["set-option", "-sq", "set-clipboard", "external"],
-        ["set-option", "-g", "mouse", "off"],
+        ["set-option", "-g", "mouse", "on"],
         ["set-option", "-g", "focus-events", "on"],
         ["set-option", "-g", "escape-time", "0"],
     ]
@@ -198,14 +204,14 @@ def _tmux_scrollback_key_commands() -> list[list[str]]:
     """
     Build root-table bindings that let attached users reach scrollback.
 
-    The managed lockdown removes every default entry point into tmux copy
-    mode — ``mouse off``, ``prefix None``, and an emptied prefix table — and
+    The managed lockdown removes the prefix-key routes into tmux copy mode
+    (``prefix None``, ``prefix2 None``, and an emptied prefix table), and
     native clients attach with ``-f /dev/null`` so a user's own tmux.conf
-    cannot restore one, leaving output above the viewport unreachable.
-    Page Up enters copy mode scrolled up one page (``-e`` returns to the
-    live view once the user scrolls back to the bottom). On the alternate
-    screen the key passes through instead, so full-screen programs keep
-    their own Page Up handling.
+    cannot restore one. The wheel reaches scrollback via ``mouse on``, but a
+    keyboard path is still wanted, so Page Up enters copy mode scrolled up one
+    page (``-e`` returns to the live view once the user scrolls back to the
+    bottom). On the alternate screen the key passes through instead, so
+    full-screen programs keep their own Page Up handling.
 
     :returns: Tmux commands binding scrollback entry keys in the root table.
     """
