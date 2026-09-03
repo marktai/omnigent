@@ -132,10 +132,16 @@ def test_codex_native_approval_mode_switch_persists(
 
     assert patch_bodies[-1] == {"approval_mode": "approve-for-me"}
 
+    # Save closes the modal only after its awaited setter chain settles; a
+    # click during that close races the dialog, so wait for it to finish.
+    expect(page.get_by_test_id("composer-config-save")).not_to_be_visible()
+
     # The store reads the mode back from the PATCH response's stamped label,
     # so reopening the modal shows the confirmed preset, not a draft.
     gear.click()
-    expect(page.get_by_test_id("composer-config-approval-mode")).to_contain_text("Approve for me")
+    picker = page.get_by_test_id("composer-config-approval-mode")
+    expect(picker).to_be_visible()
+    expect(picker).to_contain_text("Approve for me")
 
 
 def test_codex_native_approval_mode_starts_from_label(
