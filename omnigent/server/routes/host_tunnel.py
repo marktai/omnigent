@@ -27,7 +27,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
-from omnigent.errors import ErrorCategory, ErrorImpact
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
@@ -616,6 +616,9 @@ async def _receive_loop(
                     runner_id=frame.runner_id,
                     error_category=ErrorCategory.UNKNOWN.value,
                     error_impact=ErrorImpact.BLOCKING.value,
+                    # The runner may have died before or during a turn; the host
+                    # can't tell from the exit alone.
+                    error_phase=ErrorPhase.UNKNOWN.value,
                 ),
             )
             if runner_exit_reports is not None:

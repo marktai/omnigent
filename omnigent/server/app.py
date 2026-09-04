@@ -38,7 +38,7 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
     ResolvedBundle,
@@ -1835,6 +1835,7 @@ def create_app(
                     http_status="503",
                     error_category=exc.category.value,
                     error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
                 ),
             )
         elif exc.http_status >= 500:
@@ -1848,6 +1849,7 @@ def create_app(
                     http_status=str(exc.http_status),
                     error_category=exc.category.value,
                     error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
                 ),
             )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
@@ -1862,6 +1864,7 @@ def create_app(
                     http_status="400",
                     error_category=exc.category.value,
                     error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
                 ),
             )
         return JSONResponse(
@@ -1892,6 +1895,7 @@ def create_app(
                 http_status="422",
                 error_category=ErrorCategory.CLIENT.value,
                 error_impact=ErrorImpact.BENIGN.value,
+                error_phase=ErrorPhase.REQUEST.value,
             ),
         )
         return await request_validation_exception_handler(request, exc)
@@ -1932,6 +1936,7 @@ def create_app(
                     # ever address, not a human referencing a real-but-gone one.
                     error_category=ErrorCategory.CLIENT.value,
                     error_impact=ErrorImpact.BENIGN.value,
+                    error_phase=ErrorPhase.REQUEST.value,
                 ),
             )
             return JSONResponse(
@@ -1948,6 +1953,7 @@ def create_app(
                 http_status="500",
                 error_category=ErrorCategory.SERVER.value,
                 error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
             ),
         )
         return JSONResponse(
@@ -1989,6 +1995,7 @@ def create_app(
                 http_status="500",
                 error_category=ErrorCategory.UNKNOWN.value,
                 error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
                 error_type=type(exc).__name__,
             ),
         )
