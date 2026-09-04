@@ -8,13 +8,17 @@ from omnigent.errors import (
     _CODE_TO_CATEGORY,
     _CODE_TO_HTTP_STATUS,
     _CODE_TO_IMPACT,
+    _CODE_TO_PHASE,
     ErrorCategory,
     ErrorCode,
     ErrorImpact,
+    ErrorPhase,
     OmnigentError,
     category_for_code,
     classify_exception,
     impact_for_code,
+    is_before_harness_start,
+    phase_for_code,
 )
 
 
@@ -239,3 +243,55 @@ def test_classify_exception_arbitrary_is_unknown() -> None:
         ErrorCategory.UNKNOWN,
         ErrorImpact.UNKNOWN,
     )
+
+
+def test_every_error_code_has_a_phase() -> None:
+    """Every named ErrorCode declares a lifecycle phase (UNKNOWN allowed).
+
+    Unlike category/impact, UNKNOWN is a valid phase for a generic code
+    (internal_error) because the phase is context-driven, not code-driven.
+    """
+    for code in _all_error_code_values():
+        assert code in _CODE_TO_PHASE, f"{code!r} missing from _CODE_TO_PHASE"
+        assert isinstance(_CODE_TO_PHASE[code], ErrorPhase)
+
+
+@pytest.mark.parametrize(
+    "code,expected_phase,before_start",
+    [
+        (ErrorCode.INVALID_INPUT, ErrorPhase.REQUEST, True),
+        (ErrorCode.UNAUTHORIZED, ErrorPhase.REQUEST, True),
+        (ErrorCode.WRONG_REPLICA, ErrorPhase.ROUTING, True),
+        (ErrorCode.RUNNER_UNAVAILABLE, ErrorPhase.RUNNER_LAUNCH, True),
+        (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorPhase.HARNESS_SETUP, True),
+        (ErrorCode.WORKSPACE_MISSING, ErrorPhase.HARNESS_SETUP, True),
+        (ErrorCode.HARNESS_PROTOCOL_VIOLATION, ErrorPhase.TURN, False),
+        (ErrorCode.INTERNAL_ERROR, ErrorPhase.UNKNOWN, False),
+    ],
+)
+def test_code_phase_and_harness_boundary(
+    code: str, expected_phase: ErrorPhase, before_start: bool
+) -> None:
+    """Pin the phase per code and the before/after-harness-start split."""
+    assert phase_for_code(code) == expected_phase
+    assert is_before_harness_start(expected_phase) is before_start
+
+
+def test_omnigent_error_phase_default_and_override() -> None:
+    """`phase` follows the code by default; a raise-site override wins."""
+    assert (
+        OmnigentError("no harness", code=ErrorCode.HARNESS_NOT_CONFIGURED).phase
+        is ErrorPhase.HARNESS_SETUP
+    )
+    assert (
+        OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR, phase=ErrorPhase.TURN).phase
+        is ErrorPhase.TURN
+    )
+
+
+def test_harness_boundary_is_startup_not_before() -> None:
+    """The harness *start* itself (HARNESS_STARTUP) is not 'before start'."""
+    assert is_before_harness_start(ErrorPhase.HARNESS_SETUP) is True
+    assert is_before_harness_start(ErrorPhase.HARNESS_STARTUP) is False
+    assert is_before_harness_start(ErrorPhase.TURN) is False
+    assert is_before_harness_start(ErrorPhase.UNKNOWN) is False

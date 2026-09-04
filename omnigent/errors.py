@@ -73,6 +73,68 @@ class ErrorImpact(str, Enum):
     UNKNOWN = "unknown"
 
 
+class ErrorPhase(str, Enum):
+    """Where in the session/turn lifecycle an error happened.
+
+    The third axis, orthogonal to category (who) and impact (did it block): it
+    localizes the failure so "a blocking config error in HARNESS_SETUP" points at
+    a different fix than "a blocking upstream error in TURN". Members are declared
+    in lifecycle order; :func:`is_before_harness_start` splits them at the boundary
+    the operator usually cares about.
+
+    :cvar REQUEST: Request receipt, schema validation, auth (before any session
+        work): 422, invalid_input, unauthorized, forbidden.
+    :cvar ROUTING: Replica / runner routing (wrong_replica).
+    :cvar RUNNER_LAUNCH: The host is launching or connecting the runner process
+        (runner_unavailable, runner_capability_mismatch, launch failed).
+    :cvar HARNESS_SETUP: Harness preconditions on the runner before the process
+        starts (harness_not_configured, workspace_missing). Still before start.
+    :cvar HARNESS_STARTUP: The harness process is spawning / handshaking /
+        initializing. The start itself.
+    :cvar TURN: A turn is running after the harness is up (LLM calls, tool
+        dispatch, elicitations, harness_protocol_violation). After start.
+    :cvar TEARDOWN: Session/turn finalization, persistence, cleanup.
+    :cvar UNKNOWN: Not localized (e.g. a generic internal error with no active
+        phase scope).
+    """
+
+    REQUEST = "request"
+    ROUTING = "routing"
+    RUNNER_LAUNCH = "runner_launch"
+    HARNESS_SETUP = "harness_setup"
+    HARNESS_STARTUP = "harness_startup"
+    TURN = "turn"
+    TEARDOWN = "teardown"
+    UNKNOWN = "unknown"
+
+
+# Lifecycle order used only for the before/after-harness-start split.
+_PHASE_ORDER = (
+    ErrorPhase.REQUEST,
+    ErrorPhase.ROUTING,
+    ErrorPhase.RUNNER_LAUNCH,
+    ErrorPhase.HARNESS_SETUP,
+    ErrorPhase.HARNESS_STARTUP,
+    ErrorPhase.TURN,
+    ErrorPhase.TEARDOWN,
+)
+
+
+def is_before_harness_start(phase: ErrorPhase) -> bool:
+    """Whether *phase* precedes the harness process starting.
+
+    The boundary is :attr:`ErrorPhase.HARNESS_STARTUP` (the start itself is not
+    "before"). ``UNKNOWN`` returns ``False`` (we cannot claim it failed before
+    start).
+
+    :param phase: The lifecycle phase.
+    :returns: ``True`` for REQUEST..HARNESS_SETUP, ``False`` otherwise.
+    """
+    if phase not in _PHASE_ORDER:
+        return False
+    return _PHASE_ORDER.index(phase) < _PHASE_ORDER.index(ErrorPhase.HARNESS_STARTUP)
+
+
 class ErrorCode:
     """
     Error codes and their HTTP status mappings.
@@ -248,6 +310,38 @@ def impact_for_code(code: str) -> ErrorImpact:
     return _CODE_TO_IMPACT.get(code, ErrorImpact.BENIGN)
 
 
+# Lifecycle phase a code most likely failed in. A DEFAULT for coded errors; an
+# active phase_scope (ambient ContextVar) localizes uncoded exceptions. Generic
+# codes map to UNKNOWN (context, not the code, tells you where). Every ErrorCode
+# has an entry (a test asserts presence); UNKNOWN is allowed here, unlike the
+# other two axes, because a phase is genuinely context-dependent.
+_CODE_TO_PHASE: dict[str, ErrorPhase] = {
+    ErrorCode.UNAUTHORIZED: ErrorPhase.REQUEST,
+    ErrorCode.FORBIDDEN: ErrorPhase.REQUEST,
+    ErrorCode.NOT_FOUND: ErrorPhase.REQUEST,
+    ErrorCode.INVALID_INPUT: ErrorPhase.REQUEST,
+    ErrorCode.ALREADY_EXISTS: ErrorPhase.REQUEST,
+    ErrorCode.CONFLICT: ErrorPhase.REQUEST,
+    ErrorCode.WRONG_REPLICA: ErrorPhase.ROUTING,
+    ErrorCode.RUNNER_UNAVAILABLE: ErrorPhase.RUNNER_LAUNCH,
+    ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorPhase.RUNNER_LAUNCH,
+    ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,
+    ErrorCode.INTERNAL_ERROR: ErrorPhase.UNKNOWN,
+}
+
+
+def phase_for_code(code: str) -> ErrorPhase:
+    """Return the likely lifecycle phase for an error code.
+
+    :param code: An :class:`ErrorCode` string value.
+    :returns: The mapped phase, or ``UNKNOWN`` for a generic/unrecognized code
+        (an active ``phase_scope`` localizes those at log time).
+    """
+    return _CODE_TO_PHASE.get(code, ErrorPhase.UNKNOWN)
+
+
 class OmnigentError(Exception):
     """
     Application-level error with a machine-readable code.
@@ -263,6 +357,7 @@ class OmnigentError(Exception):
         code: str = ErrorCode.INTERNAL_ERROR,
         category: ErrorCategory | None = None,
         impact: ErrorImpact | None = None,
+        phase: ErrorPhase | None = None,
     ) -> None:
         """
         Create a new application error.
@@ -278,12 +373,16 @@ class OmnigentError(Exception):
             ``code`` (see :func:`impact_for_code`); pass it where the raise site
             knows the actual outcome, e.g. a normally-benign code that this time
             aborted the turn.
+        :param phase: Lifecycle-phase override. Defaults to the mapping for
+            ``code`` (see :func:`phase_for_code`); pass it where the raise site
+            knows the stage better than the code does.
         """
         super().__init__(message)
         self.code = code
         self.message = message
         self._category_override = category
         self._impact_override = impact
+        self._phase_override = phase
 
     @property
     def http_status(self) -> int:
@@ -311,6 +410,12 @@ class OmnigentError(Exception):
     def blocking(self) -> bool:
         """True when this error halts the turn/task (``impact`` is BLOCKING)."""
         return self.impact is ErrorImpact.BLOCKING
+
+    @property
+    def phase(self) -> ErrorPhase:
+        """Lifecycle phase: the constructor override if given, else the code's
+        mapping."""
+        return self._phase_override or phase_for_code(self.code)
 
 
 class ElicitationDeclinedError(Exception):

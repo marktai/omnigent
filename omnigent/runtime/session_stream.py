@@ -39,7 +39,7 @@ from omnigent.debug_logging import (
     debug_sink_enabled,
     sse_event_logger,
 )
-from omnigent.errors import ErrorImpact
+from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -214,6 +214,8 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
         impact = _TURN_OUTCOME_IMPACT.get(outcome)
         if impact is not None:
             attributes["error_impact"] = impact.value
+            # A terminal turn outcome is, by definition, in the turn phase.
+            attributes["error_phase"] = ErrorPhase.TURN.value
     level = logging.WARNING if outcome in ("failed", "incomplete") else logging.INFO
     audit_event_logger().log(level, "turn %s", outcome, extra=extra)
 

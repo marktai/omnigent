@@ -932,4 +932,5 @@ def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.Monke
         "outcome": "failed",
         "error_code": "timeout",
         "error_impact": "blocking",
+        "error_phase": "turn",
     }

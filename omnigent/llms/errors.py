@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from omnigent.errors import ErrorCategory, ErrorImpact, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase, OmnigentError
 
 # Provider ``exc.code`` / ``exc.body.error.code`` values that signal
 # a context-window overflow.  Currently OpenAI-origin codes; add
@@ -141,6 +141,11 @@ class RetryableLLMError(OmnigentError):
         fails, which the turn's terminal outcome records as blocking."""
         return ErrorImpact.TRANSIENT
 
+    @property
+    def phase(self) -> ErrorPhase:
+        """LLM calls happen while a turn is running."""
+        return ErrorPhase.TURN
+
 
 class PermanentLLMError(OmnigentError):
     """
@@ -180,6 +185,12 @@ class PermanentLLMError(OmnigentError):
         """Not retried, so blocking by default. ``ContextWindowExceededError``
         overrides this back to transient (it recovers via compaction)."""
         return ErrorImpact.BLOCKING
+
+    @property
+    def phase(self) -> ErrorPhase:
+        """LLM calls happen while a turn is running (inherited by the context
+        overflow subclass)."""
+        return ErrorPhase.TURN
 
 
 class ContextWindowExceededError(PermanentLLMError):

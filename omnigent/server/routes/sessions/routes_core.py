@@ -38,7 +38,7 @@ from omnigent.entities import (
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -469,6 +469,7 @@ def register_core_routes(
                     session_id=session_id,
                     error_category=ErrorCategory.UNKNOWN.value,
                     error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
         return runner_id, launch_failed

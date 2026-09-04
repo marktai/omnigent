@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from omnigent.errors import ErrorCategory, ErrorImpact
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.llms.errors import (
     ContextWindowExceededError,
     LLMErrorDetail,
@@ -530,4 +530,19 @@ def test_llm_error_impact() -> None:
             actual_tokens=2000,
         ).impact
         is ErrorImpact.TRANSIENT
+    )
+
+
+def test_llm_error_phase_is_turn() -> None:
+    """LLM failures happen while a turn is running, regardless of code."""
+    assert RetryableLLMError("rate limited", code="429").phase is ErrorPhase.TURN
+    assert PermanentLLMError("bad key", code="401").phase is ErrorPhase.TURN
+    assert (
+        ContextWindowExceededError(
+            "too big",
+            code="context_length_exceeded",
+            max_context_tokens=1000,
+            actual_tokens=2000,
+        ).phase
+        is ErrorPhase.TURN
     )

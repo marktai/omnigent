@@ -364,6 +364,7 @@ def _emit_retry_and_sleep(
             "llm_retry",
             error_category=error.category.value,
             error_impact=error.impact.value,
+            error_phase=error.phase.value,
             error_code=error.code,
         ),
     )
