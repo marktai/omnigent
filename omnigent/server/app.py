@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -36,7 +38,7 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, OmnigentError
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
     ResolvedBundle,
@@ -1827,7 +1829,12 @@ def create_app(
                 "Runner unavailable: %s",
                 exc.message,
                 extra=_error_audit_extra(
-                    request, phase="unavailable", code=str(exc.code), http_status="503"
+                    request,
+                    phase="unavailable",
+                    code=str(exc.code),
+                    http_status="503",
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
                 ),
             )
         elif exc.http_status >= 500:
@@ -1836,7 +1843,11 @@ def create_app(
                 exc.message,
                 exc_info=exc,
                 extra=_error_audit_extra(
-                    request, code=str(exc.code), http_status=str(exc.http_status)
+                    request,
+                    code=str(exc.code),
+                    http_status=str(exc.http_status),
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
                 ),
             )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
@@ -1845,13 +1856,45 @@ def create_app(
                 request.url.path,
                 exc.message,
                 extra=_error_audit_extra(
-                    request, phase="rejected", code=str(exc.code), http_status="400"
+                    request,
+                    phase="rejected",
+                    code=str(exc.code),
+                    http_status="400",
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
                 ),
             )
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
         )
+
+    @app.exception_handler(RequestValidationError)
+    async def _handle_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        """Log schema-validation rejections as client faults, then return the
+        stock 422 body.
+
+        A request that fails schema/transport validation is the calling
+        software's bug, not the human's (category=client), and it rejects one
+        request without harming the session (impact=benign). The response is
+        delegated to FastAPI's default handler so the 422 shape is unchanged.
+        """
+        _logger.warning(
+            "Request validation failed on %s",
+            request.url.path,
+            extra=_error_audit_extra(
+                request,
+                phase="rejected",
+                code=str(ErrorCode.INVALID_INPUT),
+                http_status="422",
+                error_category=ErrorCategory.CLIENT.value,
+                error_impact=ErrorImpact.BENIGN.value,
+            ),
+        )
+        return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
@@ -1877,7 +1920,20 @@ def create_app(
             # Keep a trace: a malformed id is usually a client bug, but this
             # branch would otherwise mask a server-side id-generation defect
             # as a routine 404.
-            _logger.debug("Malformed id mapped to 404: %s", exc.orig)
+            _logger.debug(
+                "Malformed id mapped to 404: %s",
+                exc.orig,
+                extra=_error_audit_extra(
+                    request,
+                    phase="not_found",
+                    code=str(ErrorCode.NOT_FOUND),
+                    http_status="404",
+                    # A malformed id is the caller sending a value no row can
+                    # ever address, not a human referencing a real-but-gone one.
+                    error_category=ErrorCategory.CLIENT.value,
+                    error_impact=ErrorImpact.BENIGN.value,
+                ),
+            )
             return JSONResponse(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
@@ -1887,7 +1943,11 @@ def create_app(
             exc,
             exc_info=exc,
             extra=_error_audit_extra(
-                request, code=str(ErrorCode.INTERNAL_ERROR), http_status="500"
+                request,
+                code=str(ErrorCode.INTERNAL_ERROR),
+                http_status="500",
+                error_category=ErrorCategory.SERVER.value,
+                error_impact=ErrorImpact.BLOCKING.value,
             ),
         )
         return JSONResponse(
@@ -1915,12 +1975,21 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
+        # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
+        # fault is ours. Booking it as server would inflate our fault rate; the
+        # exception type is logged as a signature to rank for promotion to a real
+        # category. The client still gets internal_error / 500.
         _logger.error(
             "Unhandled exception: %s",
             exc,
             exc_info=exc,
             extra=_error_audit_extra(
-                request, code=str(ErrorCode.INTERNAL_ERROR), http_status="500"
+                request,
+                code=str(ErrorCode.INTERNAL_ERROR),
+                http_status="500",
+                error_category=ErrorCategory.UNKNOWN.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_type=type(exc).__name__,
             ),
         )
         return JSONResponse(

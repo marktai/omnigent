@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from omnigent.errors import classify_exception
 from omnigent.process_logging import redact_log_text
 from omnigent.version import VERSION
 
@@ -420,11 +421,32 @@ def _stack_trace(record: logging.LogRecord) -> str | None:
 
 def _attributes(record: logging.LogRecord) -> dict[str, str]:
     raw = getattr(record, "attributes", None)
-    if not isinstance(raw, dict):
-        return {}
-    # The target column is MAP<STRING,STRING>; coerce values, redact them, and
-    # drop nulls. Event attributes share the same privacy boundary as messages.
-    return {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+    attrs: dict[str, str] = {}
+    if isinstance(raw, dict):
+        # The target column is MAP<STRING,STRING>; coerce values, redact them,
+        # and drop nulls. Event attributes share the same privacy boundary as
+        # messages.
+        attrs = {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+    _stamp_error_dimensions(attrs, record)
+    return attrs
+
+
+def _stamp_error_dimensions(attrs: dict[str, str], record: logging.LogRecord) -> None:
+    """Auto-attribute a logged exception the callsite did not classify itself.
+
+    Any record carrying ``exc_info`` gains ``error_category`` / ``error_impact``
+    derived from the exception (see :func:`omnigent.errors.classify_exception`),
+    so every ``_logger.exception`` / ``exc_info=…`` site across the codebase is
+    covered without per-site edits. Explicit callsite values always win.
+    """
+    if "error_category" in attrs and "error_impact" in attrs:
+        return
+    exc = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
+    if not isinstance(exc, BaseException):
+        return
+    category, impact = classify_exception(exc)
+    attrs.setdefault("error_category", category.value)
+    attrs.setdefault("error_impact", impact.value)
 
 
 def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
