@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import errno
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -93,15 +93,15 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.host.worktree_pool import (
     ManagedWorktreeConfig,
     WorktreePoolError,
     WorktreePoolManager,
     load_managed_worktree_config,
 )
-from omnigent.managed_workspace import parse_managed_workspace
-from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
+from omnigent.managed_workspace import parse_managed_workspace
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -396,6 +396,7 @@ def _stable_managed_base_refresh_jitter_s(host_id: str) -> int:
     """Spread hourly managed-base refreshes consistently across hosts."""
     digest = hashlib.sha256(host_id.encode()).digest()
     return int.from_bytes(digest[:8], byteorder="big") % _MANAGED_BASE_REFRESH_MAX_JITTER_S
+
 
 # How often the lifecycle monitor re-checks that this daemon still owns its
 # registry record. Cheap local-file read; a stale daemon retiring within a

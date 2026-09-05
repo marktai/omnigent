@@ -2278,7 +2278,7 @@ def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
     return val
 
 
-def _optional_nullable_int(msg: dict[str, Any], key: str) -> int | None:
+def _optional_nullable_int(msg: _JsonObject, key: str) -> int | None:
     """Return an optional nullable integer field."""
     val = msg.get(key)
     if val is None:
