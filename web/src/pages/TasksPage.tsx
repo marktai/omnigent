@@ -15,6 +15,7 @@ import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-re
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import {
@@ -23,9 +24,11 @@ import {
 } from "@/components/scheduled/suggestions";
 import {
   useDeleteScheduledTask,
+  useRunScheduledTaskNow,
   useScheduledTasks,
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
+import { useNow } from "@/hooks/useNow";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
@@ -40,8 +43,14 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
 
 export function TasksPage() {
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
+  const { trackClick } = useOmnigentAnalytics();
+  // A single shared, slowly-ticking clock for the whole list. Passing it down to
+  // each row (rather than each row owning a timer) keeps the relative next-run
+  // labels fresh with ONE interval regardless of how many rows are on screen.
+  const now = useNow();
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
+  const runNowMutation = useRunScheduledTaskNow();
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<FilterTab>("all");
@@ -105,12 +114,16 @@ export function TasksPage() {
   }, [tasks, search, filter]);
 
   // A per-task busy flag so a row's menu disables while its own mutation runs.
+  // Covers pause/resume (update), delete, and run-now so the ⋯ menu can't be
+  // re-triggered mid-flight for the task whose mutation is pending.
   const busyId =
     updateMutation.isPending && updateMutation.variables
       ? updateMutation.variables.id
       : deleteMutation.isPending
         ? (deleteMutation.variables as string | undefined)
-        : undefined;
+        : runNowMutation.isPending
+          ? (runNowMutation.variables as string | undefined)
+          : undefined;
 
   function handlePauseToggle(task: ScheduledTask) {
     updateMutation.mutate({
@@ -121,6 +134,10 @@ export function TasksPage() {
 
   function handleDelete(task: ScheduledTask) {
     deleteMutation.mutate(task.id);
+  }
+
+  function handleRunNow(task: ScheduledTask) {
+    runNowMutation.mutate(task.id);
   }
 
   function handleEdit(task: ScheduledTask) {
@@ -135,12 +152,17 @@ export function TasksPage() {
     <PageScroll contentClassName="px-6">
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
-          <h1 className="text-2xl font-semibold">Scheduled tasks</h1>
-          <p className="text-sm text-muted-foreground">
+          <h1 className="text-2xl font-semibold">Automations</h1>
+          <p className="text-ui text-muted-foreground">
             Run agent sessions on a recurring schedule. Tasks fire on a connected host.
           </p>
         </div>
-        <Button data-testid="new-task-button" className="shrink-0" onClick={openManual}>
+        <Button
+          data-testid="new-task-button"
+          className="shrink-0"
+          onClick={openManual}
+          componentId="tasks.new"
+        >
           New task
         </Button>
       </div>
@@ -154,7 +176,8 @@ export function TasksPage() {
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search scheduled tasks…"
+            placeholder="Search automations…"
+            componentId="tasks.search"
             data-testid="tasks-search"
             className="pl-9"
           />
@@ -167,9 +190,12 @@ export function TasksPage() {
                 type="button"
                 aria-pressed={filter === tab.value}
                 data-testid={`tasks-filter-${tab.value}`}
-                onClick={() => setFilter(tab.value)}
+                onClick={() => {
+                  trackClick(`tasks.filter_${tab.value}`, "button");
+                  setFilter(tab.value);
+                }}
                 className={cn(
-                  "rounded-md px-3 py-1 text-sm font-medium transition-colors",
+                  "rounded-md px-3 py-1 text-ui font-medium transition-colors",
                   filter === tab.value
                     ? "bg-muted text-foreground"
                     : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
@@ -186,18 +212,23 @@ export function TasksPage() {
         <div
           role="alert"
           data-testid="tasks-load-error"
-          className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm"
+          className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-ui"
         >
           <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
-          <span className="flex-1">Couldn’t load scheduled tasks.</span>
-          <Button variant="outline" size="sm" onClick={() => void refetch()}>
+          <span className="flex-1">Couldn’t load automations.</span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void refetch()}
+            componentId="tasks.retry"
+          >
             Retry
           </Button>
         </div>
       ) : isLoading ? (
-        <div className="flex items-center gap-2 py-12 text-sm text-muted-foreground">
+        <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
-          Loading scheduled tasks…
+          Loading automations…
         </div>
       ) : filtered.length === 0 ? (
         <EmptyState
@@ -206,17 +237,19 @@ export function TasksPage() {
           onPickSuggestion={openFromSuggestion}
         />
       ) : (
-        // Flat list — no boxed cards, and NO per-row hairline dividers (the row
-        // padding alone gives the spacing). The only divider on the page is the
-        // one before the Suggestions section (see SuggestionsSection).
-        <div className="flex flex-col" data-testid="tasks-list">
+        // Card list — each row is a bordered card (see ScheduledTaskRow), stacked
+        // with a gap so there's vertical spacing between cards. The only divider
+        // on the page is the one before the Suggestions section.
+        <div className="flex flex-col gap-2" data-testid="tasks-list">
           {filtered.map((task) => (
             <ScheduledTaskRow
               key={task.id}
               task={task}
+              now={now}
               busy={busyId === task.id}
               onEdit={handleEdit}
               onPauseToggle={handlePauseToggle}
+              onRunNow={handleRunNow}
               onDelete={handleDelete}
             />
           ))}
@@ -254,15 +287,13 @@ function EmptyState({
   return (
     <div className="py-8" data-testid="tasks-empty-state">
       {hasAny && (
-        <div className="py-10 text-center text-sm text-muted-foreground">
-          No scheduled tasks found
-        </div>
+        <div className="py-10 text-center text-ui text-muted-foreground">No automations found</div>
       )}
       {!hasAny && (
         <div className="flex flex-col items-center gap-2 py-12 text-center">
           <ClockIcon className="size-8 text-muted-foreground/50" />
-          <p className="text-sm font-medium">No scheduled tasks yet</p>
-          <p className="max-w-sm text-xs text-muted-foreground">
+          <p className="text-ui font-medium">No automations yet</p>
+          <p className="max-w-sm text-sm text-muted-foreground">
             Create a task to run an agent session automatically on a recurring schedule.
           </p>
           {showSuggestions && (
@@ -295,7 +326,7 @@ function SuggestionsSection({
       className={cn("mt-4 border-t border-border/60 pt-4", className)}
       data-testid="tasks-suggestions"
     >
-      {showHeading && <h2 className="mb-3 text-sm text-muted-foreground">Suggestions</h2>}
+      {showHeading && <h2 className="mb-3 text-ui text-muted-foreground">Suggestions</h2>}
       {/* Compact chips that wrap onto multiple lines. */}
       <div className="flex flex-wrap gap-2">
         {SCHEDULED_TASK_SUGGESTIONS.map((s) => {
@@ -306,7 +337,7 @@ function SuggestionsSection({
               type="button"
               onClick={() => onPick(s)}
               data-testid={`suggestion-${s.id}`}
-              className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-1.5 text-sm font-normal transition-colors hover:bg-muted hover:text-foreground"
+              className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-1.5 text-ui font-normal transition-colors hover:bg-muted hover:text-foreground"
             >
               <Icon className={cn("size-4 shrink-0", s.iconClassName)} />
               <span className="truncate">{s.title}</span>

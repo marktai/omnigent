@@ -6,6 +6,14 @@ session on a recurring schedule (``rrule``). A
 :class:`ScheduledTaskRun` records one firing of a task (its run history). This
 module holds the plain dataclasses the store converts ORM rows into; the store
 owns the JSON (de)serialization of the Text-backed columns.
+
+Naming: the user-facing product name for this feature is "Automations"
+(web UI display copy only). The domain model, DB tables
+(``scheduled_tasks`` / ``scheduled_task_runs``), stores, REST paths
+(``/v1/scheduled-tasks``), agent tools (``sys_scheduled_task_*``), and
+these types deliberately keep the name "scheduled task". Keep code,
+comments, and schema on "scheduled task"; only presentation strings say
+"Automations".
 """
 
 from __future__ import annotations
@@ -37,6 +45,16 @@ class ScheduledTask:
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
+    :param permission_mode: Per-task permission mode for native coding harnesses
+        that support one (currently Claude Code), e.g. ``"acceptEdits"`` or
+        ``"bypassPermissions"``. The fire path turns it into the runner's
+        ``["--permission-mode", <value>]`` terminal launch args. ``None`` means
+        use the agent's configured default.
+    :param max_cost_usd: Optional per-firing cost budget in USD. When set, the
+        fire path attaches a ``cost_budget`` policy to each spawned session that
+        blocks all models once cumulative spend reaches this limit. ``None``
+        means no per-firing cost cap (the session runs unconstrained unless the
+        agent spec or server-wide defaults impose one).
     :param workspace: Absolute existing path where a fired session's connected
         host runner should start. ``None`` only for legacy or invalid rows.
     :param base_branch: Reserved legacy column; scheduled tasks currently do
@@ -66,6 +84,8 @@ class ScheduledTask:
     workspace_id: int = 0
     model_override: str | None = None
     reasoning_effort: str | None = None
+    permission_mode: str | None = None
+    max_cost_usd: float | None = None
     workspace: str | None = None
     base_branch: str | None = None
     execution_target: str = "connected_host"

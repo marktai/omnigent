@@ -16,12 +16,7 @@ export type ScheduledTaskState = "active" | "paused";
 
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
-  | "scheduled"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "skipped"
-  | "incomplete";
+  "scheduled" | "running" | "succeeded" | "failed" | "skipped" | "incomplete";
 
 /**
  * A scheduled task, camelCased from the server's `_to_response` shape. The
@@ -43,6 +38,12 @@ export interface ScheduledTask {
   updatedAt: number;
   modelOverride: string | null;
   reasoningEffort: string | null;
+  /**
+   * Native-harness permission mode (Claude Code), e.g. `acceptEdits`, or `null`
+   * to use the agent's configured default. The server derives the runner's
+   * `--permission-mode` launch arg from it at fire time.
+   */
+  permissionMode: string | null;
   /** Pinned absolute workspace, or `null` (server defaults to the host home). */
   workspace: string | null;
   /** Pinned host, or `null` (server resolves the connected host at fire time). */
@@ -50,7 +51,21 @@ export interface ScheduledTask {
   state: ScheduledTaskState;
   /** Epoch seconds of the last fire, or `null` if it has never fired. */
   lastRunAt: number | null;
+  /**
+   * Status of the task's MOST RECENT run (`succeeded` / `failed` / `skipped` /
+   * `running` / `scheduled` / `incomplete`), or `null` when the task has never
+   * run. Server-computed from the latest run row so the list can show a
+   * completion badge without a per-row `/runs` fetch.
+   */
+  lastRunStatus: ScheduledTaskRunStatus | null;
   lastRunConversationId: string | null;
+  /**
+   * ISO-8601 timestamp of the next scheduled fire, computed by the SERVER's
+   * live scheduler (its authoritative anchor), or `null` when the task is
+   * paused / not armed. Never recompute this on the client — a client-computed
+   * next-run can't match the server anchor for INTERVAL>1 rules.
+   */
+  nextRunAt: string | null;
 }
 
 /** One run of a scheduled task, camelCased from `_run_to_response`. */
@@ -75,6 +90,8 @@ export interface CreateScheduledTaskInput {
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
+  /** Native-harness permission mode (Claude Code); omit for the agent default. */
+  permissionMode?: string | null;
   /** Optional pinned workspace; only valid together with `hostId`. */
   workspace?: string | null;
   /** Optional pinned host. */
@@ -90,9 +107,17 @@ export interface UpdateScheduledTaskInput {
   name?: string;
   prompt?: string;
   rrule?: string;
+  /**
+   * Rebind the task to a different agent, switching the harness its future
+   * firings run. The server clears `modelOverride` / `reasoningEffort` /
+   * `permissionMode` on a switch (a model id is provider-bound, permission mode
+   * is Claude-only) unless the same PATCH resends them.
+   */
+  agentId?: string;
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
+  permissionMode?: string | null;
   workspace?: string;
   hostId?: string;
   state?: ScheduledTaskState;
@@ -111,11 +136,14 @@ interface ScheduledTaskWire {
   updated_at: number;
   model_override: string | null;
   reasoning_effort: string | null;
+  permission_mode: string | null;
   workspace: string | null;
   host_id: string | null;
   state: ScheduledTaskState;
   last_run_at: number | null;
+  last_run_status: ScheduledTaskRunStatus | null;
   last_run_conversation_id: string | null;
+  next_run_at: string | null;
 }
 
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
@@ -183,11 +211,14 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     updatedAt: wire.updated_at,
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
+    permissionMode: wire.permission_mode,
     workspace: wire.workspace,
     hostId: wire.host_id,
     state: wire.state,
     lastRunAt: wire.last_run_at,
+    lastRunStatus: wire.last_run_status,
     lastRunConversationId: wire.last_run_conversation_id,
+    nextRunAt: wire.next_run_at,
   };
 }
 
@@ -240,6 +271,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
+  if (input.permissionMode != null) body.permission_mode = input.permissionMode;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
   const res = await authenticatedFetch("/v1/scheduled-tasks", {
@@ -263,9 +295,11 @@ export async function updateScheduledTask(
   if (input.name !== undefined) body.name = input.name;
   if (input.prompt !== undefined) body.prompt = input.prompt;
   if (input.rrule !== undefined) body.rrule = input.rrule;
+  if (input.agentId !== undefined) body.agent_id = input.agentId;
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
+  if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;
   if (input.state !== undefined) body.state = input.state;
@@ -281,6 +315,20 @@ export async function updateScheduledTask(
 export async function deleteScheduledTask(id: string): Promise<void> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
     method: "DELETE",
+  });
+  if (!res.ok) throw await errorFromResponse(res);
+}
+
+/**
+ * Trigger an immediate ("run now") fire of a task. A manual override that
+ * reuses the server's shared fire path; paused tasks are runnable. The server
+ * responds `202 Accepted` (the run launches in the background), so this returns
+ * `void` — callers invalidate the list + runs queries to pick up the new run's
+ * status. A `409` (already in flight) surfaces as a {@link ScheduledTaskApiError}.
+ */
+export async function runScheduledTaskNow(id: string): Promise<void> {
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/run`, {
+    method: "POST",
   });
   if (!res.ok) throw await errorFromResponse(res);
 }

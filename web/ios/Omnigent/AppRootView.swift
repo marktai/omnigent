@@ -3,6 +3,7 @@ import SwiftUI
 struct AppRootView: View {
   @EnvironmentObject private var settings: SettingsStore
   @EnvironmentObject private var router: AppRouter
+  @StateObject private var theme = ThemeController.shared
   @State private var mode: Mode
 
   /// A deep link to a server the user has never connected to, awaiting the
@@ -41,12 +42,14 @@ struct AppRootView: View {
           // Record the CLEAN server URL (no /c/<id>) — the conversation path
           // lives only in the load URL, never in recents, so a later deep link
           // resolves against an un-polluted server identity.
-          loadSucceeded: { _ in
+          loadSucceeded: {
             settings.rememberRecentServer(serverURL)
           }
         )
       }
     }
+    .environmentObject(theme)
+    .preferredColorScheme(theme.source.colorScheme)
     .task {
       guard shouldAutoOpenSavedServer else { return }
       // A deep link that arrived before this task ran already moved us off the
@@ -187,7 +190,7 @@ extension AppRootView {
 
   /// Consent was given for an unknown server — discover the workspace mount
   /// (the only network request, AFTER consent), then switch. The origin is
-  /// unchanged by the probe (it only appends `/ml/omnigents` under it), so the
+  /// unchanged by the probe (it only appends the SPA mount path under it), so the
   /// consent decision stands. Recording the server happens on load success
   /// (loadSucceeded), so a server that fails to load isn't remembered.
   private func confirmUnknownDeepLink() {
@@ -211,7 +214,8 @@ extension AppRootView {
   }
 
   /// Join a basename-less SPA path (`/c/<id>`) onto a server URL that may carry
-  /// a workspace mount (`/ml/omnigents`). The path lives UNDER the mount, so it
+  /// a workspace mount (`WorkspaceURLExpander.workspaceUIPath`). The path lives
+  /// UNDER the mount, so it
   /// is string-concatenated (not URL-resolved, which would anchor against the
   /// origin and drop the mount) — mirroring the desktop's `resolveServerPath`.
   private func conversationURL(for serverURL: URL, path: String) -> URL {

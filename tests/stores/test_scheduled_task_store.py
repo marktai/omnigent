@@ -52,6 +52,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         timezone="America/Los_Angeles",
         model_override="claude-opus-4-7",
         reasoning_effort="high",
+        permission_mode="acceptEdits",
         workspace="/home/alice/repo",
         host_id=_uid("host_abc123"),
     )
@@ -65,6 +66,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.timezone == "America/Los_Angeles"
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
+    assert task.permission_mode == "acceptEdits"
     assert task.workspace == "/home/alice/repo"
     assert task.base_branch is None
     assert task.execution_target == "connected_host"
@@ -89,6 +91,7 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     )
     assert task.model_override is None
     assert task.reasoning_effort is None
+    assert task.permission_mode is None
     assert task.workspace is None
     assert task.base_branch is None
     assert task.execution_target == "connected_host"
@@ -374,6 +377,64 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
     assert updated.updated_at is not None
 
 
+def test_update_rebinds_agent_and_keeps_run_history(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``update(agent_id=...)`` switches the harness without touching past runs.
+
+    This is what makes an in-place harness switch preferable to recreating the
+    task: the run rows stay attached to the same task id.
+    """
+    store.create(
+        scheduled_task_id=_uid("st_rebind"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="u",
+        agent_id=_uid("ag_old"),
+        timezone="UTC",
+    )
+    store.create_run(
+        run_id=_uid("sr_old"),
+        scheduled_task_id=_uid("st_rebind"),
+        status="succeeded",
+        scheduled_at=100,
+        conversation_id=_uid("conv_old"),
+        fired_at=101,
+        finished_at=102,
+    )
+
+    updated = store.update(_uid("st_rebind"), agent_id=_uid("ag_new"))
+    assert updated is not None
+    assert updated.agent_id == _uid("ag_new")
+    assert updated.updated_at is not None
+    reread = store.get(_uid("st_rebind"))
+    assert reread is not None and reread.agent_id == _uid("ag_new")
+
+    runs, _ = store.list_runs(_uid("st_rebind"))
+    assert [r.id for r in runs] == [_uid("sr_old")]
+    # The completed run keeps the conversation it actually ran in.
+    assert runs[0].conversation_id == _uid("conv_old")
+
+
+def test_update_omitting_agent_id_leaves_the_binding_unchanged(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """An ordinary edit must never silently retarget the harness."""
+    store.create(
+        scheduled_task_id=_uid("st_keepagent"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="u",
+        agent_id=_uid("ag_keep"),
+        timezone="UTC",
+    )
+    updated = store.update(_uid("st_keepagent"), name="renamed")
+    assert updated is not None
+    assert updated.agent_id == _uid("ag_keep")
+
+
 def test_update_noop_leaves_updated_at_none(store: SqlAlchemyScheduledTaskStore) -> None:
     """An update that changes nothing does not stamp ``updated_at``."""
     store.create(
@@ -630,6 +691,65 @@ def test_update_host_id_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskSto
     fetched = store.get(_uid("st_clear_host"))
     assert fetched is not None
     assert fetched.host_id is None
+
+
+def test_update_overrides_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Passing ``None`` for an override clears it to NULL (set→agent default).
+
+    Covers the security-relevant case: a task launched with
+    ``permission_mode="bypassPermissions"`` must be resettable to the agent
+    default through the same edit-then-save path the dialog uses (control reset
+    to Default → the API sends an explicit ``null``). Same for model/effort.
+    """
+    store.create(
+        scheduled_task_id=_uid("st_clear_ovr"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        model_override="opus",
+        reasoning_effort="high",
+        permission_mode="bypassPermissions",
+    )
+    updated = store.update(
+        _uid("st_clear_ovr"),
+        model_override=None,
+        reasoning_effort=None,
+        permission_mode=None,
+    )
+    assert updated is not None
+    assert updated.model_override is None
+    assert updated.reasoning_effort is None
+    assert updated.permission_mode is None
+    fetched = store.get(_uid("st_clear_ovr"))
+    assert fetched is not None
+    assert fetched.permission_mode is None
+
+
+def test_update_omitting_overrides_leaves_them_unchanged(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Omitting the override params does NOT clear them (sentinel = unchanged)."""
+    store.create(
+        scheduled_task_id=_uid("st_keep_ovr"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        model_override="opus",
+        reasoning_effort="high",
+        permission_mode="acceptEdits",
+    )
+    # Update name only — the overrides must be untouched.
+    updated = store.update(_uid("st_keep_ovr"), name="renamed")
+    assert updated is not None
+    assert updated.model_override == "opus"
+    assert updated.reasoning_effort == "high"
+    assert updated.permission_mode == "acceptEdits"
 
 
 def test_update_last_run_conversation_id_can_be_cleared_to_null(
@@ -915,6 +1035,143 @@ def test_list_running_runs_for_tasks_is_workspace_scoped(
     with workspace_scope(11):
         got = store.list_running_runs_for_tasks([_uid("task_w11")])
         assert [r.id for r in got] == [_uid("run_w11")]
+
+
+# ── list_latest_run_status_for_tasks (Tasks-list completion badge source) ─────
+
+
+def test_list_latest_run_status_for_tasks_returns_most_recent_status(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Returns each task's single most-recent run status by scheduled_at DESC.
+
+    Powers the Tasks-list completion badge in one windowed query. A task with a
+    terminal run followed by a newer run reports the NEWER run's status (so a
+    run-now firing becomes the badge as soon as it is recorded).
+    """
+    for seed in ("a", "b"):
+        store.create(
+            scheduled_task_id=_uid(f"lst_{seed}"),
+            name=seed,
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+    # task_a: an older succeeded run, then a newer failed run — failed wins.
+    store.create_run(
+        run_id=_uid("lst_a_old"),
+        scheduled_task_id=_uid("lst_a"),
+        status="succeeded",
+        scheduled_at=100,
+        finished_at=105,
+    )
+    store.create_run(
+        run_id=_uid("lst_a_new"),
+        scheduled_task_id=_uid("lst_a"),
+        status="failed",
+        scheduled_at=200,
+        finished_at=205,
+    )
+    # task_b: a single running run.
+    store.create_run(
+        run_id=_uid("lst_b_run"),
+        scheduled_task_id=_uid("lst_b"),
+        status="running",
+        scheduled_at=150,
+    )
+
+    got = store.list_latest_run_status_for_tasks([_uid("lst_a"), _uid("lst_b")])
+    assert got == {_uid("lst_a"): "failed", _uid("lst_b"): "running"}
+
+
+def test_list_latest_run_status_tiebreaks_on_id_desc(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Two runs at the SAME scheduled_at break the tie on id DESC.
+
+    Mirrors ``list_runs``' compound ``(scheduled_at DESC, id DESC)`` order so the
+    reported status matches the run that heads that task's history.
+    """
+    store.create(
+        scheduled_task_id=_uid("lst_tie"),
+        name="tie",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    # Same scheduled_at; the store orders id DESC, so whichever id sorts higher
+    # is "latest". Compute that deterministically and assert its status wins.
+    low_id, high_id = sorted([_uid("tie_x"), _uid("tie_y")])
+    store.create_run(
+        run_id=low_id,
+        scheduled_task_id=_uid("lst_tie"),
+        status="succeeded",
+        scheduled_at=300,
+        finished_at=305,
+    )
+    store.create_run(
+        run_id=high_id,
+        scheduled_task_id=_uid("lst_tie"),
+        status="skipped",
+        scheduled_at=300,
+    )
+    got = store.list_latest_run_status_for_tasks([_uid("lst_tie")])
+    assert got == {_uid("lst_tie"): "skipped"}
+
+
+def test_list_latest_run_status_omits_tasks_with_no_runs(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A task that has never run is absent from the map (badge → never run)."""
+    store.create(
+        scheduled_task_id=_uid("lst_norun"),
+        name="norun",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    assert store.list_latest_run_status_for_tasks([_uid("lst_norun")]) == {}
+
+
+def test_list_latest_run_status_empty_ids_returns_empty(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """An empty task-id list short-circuits to an empty map (no query)."""
+    assert store.list_latest_run_status_for_tasks([]) == {}
+
+
+def test_list_latest_run_status_is_workspace_scoped(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A task's runs are invisible to the latest-status query from another workspace."""
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("lst_w11"),
+            name="w11",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="a",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("lst_w11_run"),
+            scheduled_task_id=_uid("lst_w11"),
+            status="succeeded",
+            scheduled_at=100,
+            finished_at=105,
+        )
+    assert store.list_latest_run_status_for_tasks([_uid("lst_w11")]) == {}
+    with workspace_scope(11):
+        assert store.list_latest_run_status_for_tasks([_uid("lst_w11")]) == {
+            _uid("lst_w11"): "succeeded"
+        }
 
 
 # ── get_running_run_by_conversation (event-hook reverse lookup) ───────────────

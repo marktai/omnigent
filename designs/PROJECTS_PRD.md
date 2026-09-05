@@ -163,7 +163,7 @@ class SqlProject(OmnigentBase):
     # permission table the way session ownership is. Correct here precisely
     # because projects have no ACL and are owner-private (§9) — see the
     # "Where ownership lives" note below. None in single-user/OSS mode.
-    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # No `position` column: ordering is deferred and, when added, will be a
@@ -173,9 +173,9 @@ class SqlProject(OmnigentBase):
         # "list my projects": prefix scan on (workspace_id, owner). Server
         # returns a stable order (e.g. created_at / name); the client may
         # re-order locally.
-        Index("ix_projects_owner", "workspace_id", "owner_user_id", "id"),
-        # Per-owner name uniqueness (§7.1); app validates too.
-        Index("uq_projects_owner_name", "workspace_id", "owner_user_id", "name", unique=True),
+        Index("ix_projects_owner", "workspace_id", "user_id", "id"),
+        # Per-owner name uniqueness (§7.1) is a store-level check
+        # (`_name_taken`), not a unique index — see the table below.
     )
 ```
 
@@ -195,8 +195,8 @@ Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id")
 |---|---|---|
 | `id` type | `String(64)`, `proj_`-prefixed | Reads as a sibling of `conv_…` ids; lives in the metadata String column. Newest tables use `Uuid16` — diverge here for readability + column symmetry. |
 | Membership location | `project_id` on `omnigent_conversation_metadata` | Metadata already holds host/workspace/runner; `list_conversations` can filter it inline. |
-| Name uniqueness | per-`(workspace, owner)` unique index | Matches §7.1; case-sensitivity still open (Q3). |
-| Ownership | `owner_user_id` **column on the row** | See "Where ownership lives" below — differs from sessions on purpose. |
+| Name uniqueness | store-level check, **no** unique index | Matches §7.1; case-sensitivity still open (Q3). The unique index shipped in Phase 1a and was dropped in `d5e6f7a8b9c0`: it never held for single-user mode (NULL owner, and SQL treats NULLs as distinct), and `name` is mutable, so it was maintained on every rename. Concurrent creates/renames to one name can now both land. |
+| Ownership | `user_id` **column on the row** | See "Where ownership lives" below — differs from sessions on purpose. |
 | Ordering | **no `position` column** | Reorder is deferred and client-only (§7.2); no server state until proven needed. |
 | Deferred columns | default host/workspace/harness/model, memory/context refs | Added in Phase 2/3, not now. |
 
@@ -209,12 +209,12 @@ shareable:
   `list_projects(owned_by=...)`). This is required *because sessions are shared*:
   ownership is just the top row among many `(user, level)` grants.
 - **`scheduled_tasks`** — a personal, non-shareable artifact with no ACL — instead
-  stamps `owner_user_id` directly on the row (`db_models.py:1298`), indexed
-  `(workspace_id, owner_user_id, id)`.
+  stamps `user_id` directly on the row (`db_models.py:1298`), indexed
+  `(workspace_id, user_id, id)`.
 
 Projects follow `scheduled_tasks`, not sessions, **because §9 gives them no
 project-level ACL** — they're owner-private, single-owner, never granted to
-anyone else. With no `project_permissions` table to derive from, `owner_user_id`
+anyone else. With no `project_permissions` table to derive from, `user_id`
 on the row is the correct and consistent choice. (The v1 label-based
 `list_projects` derives ownership from `session_permissions` only because a label
 has no row of its own to stamp — the first-class table removes that constraint.)
@@ -448,10 +448,12 @@ Tracks what has actually landed vs. what remains. Updated as work ships.
 Shipped: the project **container** — create, list, rename, and delete empty
 projects. Session→project membership landed separately in Phase 1b (below).
 - ✅ **`projects` table** — `SqlProject` (`db_models.py`): `id` (Uuid16),
-  `name`, `owner_user_id`, `created_at`, `updated_at`. Owner-scoped index; a
-  UNIQUE index on `(workspace_id, owner_user_id, name)` enforces per-owner name
+  `name`, `user_id`, `created_at`, `updated_at`. Owner-scoped index; a
+  UNIQUE index on `(workspace_id, user_id, name)` enforced per-owner name
   uniqueness at the DB layer for non-NULL owners (the store's `_name_taken`
-  check guards NULL-owner / single-user rows, which SQL treats as distinct).
+  check guarded NULL-owner / single-user rows, which SQL treats as distinct).
+  That index was later dropped in `d5e6f7a8b9c0`, leaving `_name_taken` the
+  sole guard for every owner.
   (No `config` column in Phase 1a — deferred so we didn't ship an unused
   column; added in Phase 2 via migration `b3c4d5e6f7a8`, see the TODO below.)
 - ✅ **Migration** `b1c2d3e4f5a6` — creates the `projects` table only;
@@ -459,7 +461,8 @@ projects. Session→project membership landed separately in Phase 1b (below).
 - ✅ **Entity** — `Project` (`entities/project.py`).
 - ✅ **Store** — `ProjectStore` + `SqlAlchemyProjectStore` (create/get/list/
   update/delete, owner-scoped; `IntegrityError` → `ALREADY_EXISTS` as the DB
-  backstop for the uniqueness race).
+  backstop for the uniqueness race — removed with the index in
+  `d5e6f7a8b9c0`).
 - ✅ **API** — `POST/GET/PATCH/DELETE /v1/projects` (`routes/projects.py`),
   request/response schemas, wired into `create_app` + CLI; `openapi.json`
   regenerated. Every handler is owner-scoped (projects are owner-private).
@@ -518,15 +521,10 @@ folder), carrying the first-class `id` when one exists.
 - ✅ Tests: `projectsApi` unit tests; reworked hook tests (resolve→file,
   create-on-demand, archive+unfile+delete); sidebar/composer suites updated;
   server union test. Empty folders read "No sessions".
-- ⬜ **Deferred (kept on the name/label path via dual-read):** the new-session
-  prefill state machine and the Settings archived-only project picker still read
-  the `omni_project` label; retiring label reads from the UI is gated on the
-  Phase 4 backfill. TS client types are not codegen-regenerated (hand-written
-  `projectsApi`).
 
-### TODO
-- ✅ **Benchmark (#3094).** Added `list_projects` (sidebar project list,
-  dual-read union) and `list_project_sessions` (`?project=` folder fetch)
+### Done (Benchmark — #3094)
+- ✅ **Latency journeys + corpus seeder.** Added `list_projects` (sidebar project
+  list, dual-read union) and `list_project_sessions` (`?project=` folder fetch)
   latency journeys to `dev/benchmarks/omnigent`, mirroring the `list_sessions`
   hot read path. The corpus seeder now also seeds first-class `projects` rows
   and files a configurable fraction of sessions into them (`--projects`,
@@ -534,7 +532,10 @@ folder), carrying the first-class `id` when one exists.
   empty project set, and the PR benchmark regression check runs on
   `dev/benchmarks/**` changes. CRUD writes remain unbenchmarked (infrequent
   single-row ops).
-- 🚧 **Phase 2 — project defaults (P4a).** In progress, split across PRs:
+
+### Done (Phase 2 — project defaults, P4a)
+Complete, shipped across several PRs: default host/workspace/agent + an opt-in
+worktree stored on the project and seeded into the new-chat composer.
   - ✅ **Backend `config` column.** Added a nullable `config` column to
     `projects` (migration `b3c4d5e6f7a8`, additive with a clean downgrade) and
     plumbed it through the store/entity/API. `config` is an **opaque JSON
@@ -545,38 +546,76 @@ folder), carrying the first-class `id` when one exists.
     distinguishes `config=None` (leave unchanged) from `config={}` (clear), so
     a rename never wipes stored defaults. Exposed on `ProjectObject` /
     `CreateProjectRequest` / `UpdateProjectRequest` (openapi regenerated).
-  - ⬜ **Seed defaults into the new-chat dialog.** Read the stored `config` and
-    pre-fill host/workspace/harness/model in the composer, always overridable,
-    silently dropping any hint that isn't currently satisfiable (e.g. the
-    default host is offline). Land the deferred backend hardening here, once the
-    config key vocabulary firms up (from the #3108 review): (a) bound the
-    serialized `config` size on create/update — the value is persisted verbatim
-    and reflected back, so an unbounded blob is a mild storage/response-size
-    amplifier; (b) make `_decode_config` defensive — coerce a non-dict blob
-    (future writer / manual DB edit) back to `{}` rather than returning it raw.
-  - ⬜ **Replace the inference-based prefill (PR #2133).** That merged PR
-    prefills the composer by *inferring* defaults from the project's newest
+  - ✅ **Settings editor.** A "Project settings" dialog
+    (`web/src/shell/ProjectSettingsDialog.tsx`, reached from the project-folder
+    kebab menu) writes a project's `config`: host, working directory, default
+    agent, and an opt-in "Random worktree" toggle. The `config` shape the client
+    owns is `{ host_id?, workspace?, agent_id?, use_worktree? }`. Fields are
+    optional (an unset one stores no key); an all-default dialog clears to `{}`.
+    Worktrees are **opt-in** — the toggle defaults OFF and only an explicit ON is
+    stored as `use_worktree: true` (matching "worktrees are opt-in at create
+    time"). The host/agent pickers and filesystem browser reuse the composer's
+    components.
+  - ✅ **Seed defaults into the new-chat dialog.** The composer reads the stored
+    `config` and pre-fills host / working directory / agent, always overridable,
+    silently dropping any hint that isn't currently satisfiable (e.g. the default
+    host is offline, or the configured agent is no longer registered). An unset
+    field falls through to the composer's generic defaults (last host, recent
+    workspace, last-used agent). The prefill machine waits while the projects
+    list (name → id) or the config query is still loading, so a generic default
+    can't win the race. An opt-in worktree (`use_worktree: true`) generates a
+    fresh `worktree-<hex>` branch once the workspace is in place and confirmed a
+    git repo — including for empty projects, where the workspace comes from the
+    config or the home-fallback.
+  - ✅ **Backend `config` hardening (from the #3108 review).** Both landed in
+    `stores/project_store/sqlalchemy_store.py`: (a) `_encode_config` bounds the
+    serialized `config` at 64 KiB (`_CONFIG_MAX_SERIALIZED_LEN`) and raises
+    `INVALID_INPUT` past it — the value is persisted verbatim and reflected back,
+    so an unbounded blob is a mild storage/response-size amplifier; (b)
+    `_decode_config` coerces a non-dict blob (future writer / manual DB edit) back
+    to `{}` rather than returning it raw, so callers can always treat config as a
+    mapping.
+  - ✅ **Replaced the inference-based prefill (PR #2133).** That merged PR
+    prefilled the composer by *inferring* defaults from the project's newest
     session (host/agent/repo + a fresh worktree branch) — an explicit non-goal
-    workaround for the absence of stored project defaults. Once the dialog reads
-    the stored `config`, retire that inference path
-    (`web/src/shell/projectPrefill.ts` and `useNewestProjectSession`) in favor
-    of the stored defaults, so there's one source of truth for a project's
-    defaults instead of guessing from history.
-- ⬜ **Phase 3 — memory & context (P4b/P4c)** — new `project_memory` /
-  `project_context` tables + agent read/write + injection (§8.2/§8.3).
-- ⬜ **Phase 4 — label consolidation (deferred; not required for the feature).**
+    workaround for the absence of stored project defaults. Now that the dialog
+    reads the stored `config`, the inference path is retired: `projectPrefill.ts`
+    is collapsed to config-only seeding, and `useNewestProjectSession` (plus its
+    `["project-newest-session"]` cache invalidations) is removed. Stored config
+    is the single source of truth for a project's defaults; a project with no
+    config prefills nothing project-specific (just the generic defaults).
+
+### TODO
+**Postponed.** Phases 1–2 (first-class projects + defaults) are shipped. Phases 3
+and 4 below are **not scheduled**, each on a different trigger: Phase 3 waits for
+customer evidence that project memory/context is wanted; Phase 4 waits until
+telemetry shows most clients have migrated to a version that writes `project_id`
+(so retiring the label path is safe). Both are additive and independent, so either
+can start whenever its trigger lands.
+
+- ⏸️ **Phase 3 — memory & context (P4b/P4c)** — new `project_memory` /
+  `project_context` tables + agent read/write + injection (§8.2/§8.3). Postponed:
+  the largest remaining chunk and the one with open design questions (§14 Q5/Q6);
+  wait for customer evidence that cross-session project memory/context is wanted
+  before committing to a storage + agent-surface design.
+- ⏸️ **Phase 4 — label consolidation (postponed; not required for the feature).**
   Because the server dual-reads (a session is "in project X" if it has *either* a
   `project_id` *or* the `omni_project` label — see §13), the first-class feature
   works end-to-end without touching the label path, so this whole phase is
-  deferred and may never be needed. Two steps, both optional:
+  deferred and may never be needed. Postponed until telemetry shows most clients
+  have migrated to a version that writes `project_id` — retiring the label path is
+  only safe once old label-writing clients are gone. Two steps, both optional:
   - **Label → `project_id` backfill** — a **separate one-off command/migration**
     converting existing `omni_project` label-projects (real production data) into
     `projects` rows. Gives a clean single source of truth, but dual-read means it
     is **not mandatory** — only needed if/when we decide to retire the label path.
   - **Retire the label path** — remove the `omni_project` reads/writes and the
-    `?project=<name>` filter. Last step, if ever; do only after the backfill has
-    run and telemetry shows no client still writes labels. Keeping the label path
-    is cheap, so treat retirement as opportunistic cleanup, not a milestone.
+    `?project=<name>` filter. This includes the one UI reader still on the label
+    path: the Settings archived-only project picker
+    (`fetchAllArchivedProjectNames`) derives its options from the `omni_project`
+    label. Last step, if ever; do only after the backfill has run and telemetry
+    shows no client still writes labels. Keeping the label path is cheap, so
+    treat retirement as opportunistic cleanup, not a milestone.
 
 ## 13. Backwards compatibility (mixed server / client versions)
 

@@ -1,8 +1,91 @@
 import type { Conversation } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
+
+// ── Legacy localStorage pin helpers ───────────────────────────────────────
+//
+// Pins are server-authoritative now, but two paths still touch the legacy
+// localStorage key: the one-time server migration, and the pin toggle's
+// fallback when the server can't yet store pins (`filterHonored === false` — a
+// pre-upgrade server that ignores `?pinned=true`). Kept in this leaf module so
+// both the Sidebar and the `useConversations` toggle hook can use them without
+// an import cycle.
+
+/** Read the legacy pin ids, migrated to bare-hex form. Corrupt/absent ⇒ []. */
+export function readPinnedConversationIds(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // Migrate legacy prefixed ids (``conv_<hex>``) to the bare-hex form the API
+    // returns post id-to-binary migration; callers re-persist so the one-time
+    // rewrite is durable across reloads.
+    return migratePinnedConversationIds(
+      parsed.filter((value): value is string => typeof value === "string"),
+    );
+  } catch {
+    // Browser storage is user-editable and can contain stale/corrupt values.
+    // Treat bad pin state as "no pins" instead of breaking navigation.
+    return [];
+  }
+}
+
+/** Remove the legacy pin key entirely (migration complete). */
+export function clearLegacyPinnedConversationIds(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+  } catch {
+    // Best-effort cleanup — a stale key is harmless (dedup + migration guard
+    // skip already-known ids), so a failure here needn't surface.
+  }
+}
+
+// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Throws if the
+// browser rejects the write (e.g. storage quota exceeded); no window ⇒ no-op.
+function writeLegacyPinnedConversationIdsOrThrow(ids: readonly string[]): void {
+  if (typeof window === "undefined") return;
+  if (ids.length === 0) {
+    window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+  } else {
+    window.localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(ids));
+  }
+}
+
+// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Best-effort:
+// swallows write errors. Used by the migration to retain only the pins whose
+// server write failed — a failure here just means the migration retries on the
+// next load, so it must not surface.
+export function writeLegacyPinnedConversationIds(ids: readonly string[]): void {
+  try {
+    writeLegacyPinnedConversationIdsOrThrow(ids);
+  } catch {
+    // Best-effort — a failed write is retried on the next load.
+  }
+}
+
+/**
+ * Add or remove a single id in the legacy localStorage pin list, most-recently-
+ * pinned-first (matching the pre-server ordering the migration relies on).
+ * Used by the pin toggle's old-server fallback so a pin created before the
+ * server upgrade survives in localStorage and later migrates like any other
+ * pre-upgrade pin.
+ *
+ * Throws if the write fails (unlike the migration's best-effort write): this is
+ * the fallback's ONLY persistence, so a swallowed failure would let the toggle
+ * report success while the pin silently vanishes on reload. Throwing rejects
+ * the mutation instead, so its optimistic patch rolls back and the UI honestly
+ * shows the pin didn't take — matching the server PATCH path's failure handling.
+ */
+export function setLegacyPinnedConversationId(id: string, pinned: boolean): void {
+  const rest = readPinnedConversationIds().filter((x) => x !== id);
+  writeLegacyPinnedConversationIdsOrThrow(pinned ? [id, ...rest] : rest);
+}
 
 // Titles of sidebar sections the user has collapsed, e.g. ["Archived"].
 // Keyed by display title — stable identifiers for these fixed groups.
@@ -75,6 +158,9 @@ export function getConversationAgentType(conversation: Conversation): string {
 
 export function conversationDisplayLabel(conversation: Conversation): string {
   if (conversation.title) return conversation.title;
+  // Just-created session: its first prompt stands in until a real title lands.
+  const optimistic = getOptimisticTitle(conversation.id);
+  if (optimistic !== undefined) return optimistic;
   const label = nativeWrapperLabel(conversation);
   if (label !== null) return label;
   return UNTITLED_CONVERSATION_LABEL;
@@ -98,12 +184,33 @@ export function filterConversations(
 // pill. The active chat uses its frozen snapshot from
 // `activeOverride` instead of its live `updated_at`, so sending a message
 // in the chat you're already viewing doesn't move it.
+//
+// `frozenKeys` (when non-null) pins EVERY row's sort key at its
+// first-seen value: a row's key is read from the map, or captured into it
+// on first sight. The sidebar passes its map while the pointer is inside
+// the list, so background `updated_at` bumps can't slide rows under the
+// cursor — a mid-interaction reorder sends clicks, right-clicks, and the
+// renames they trigger to the wrong session. Rows first seen while frozen
+// (a folder expanding, a page loading) capture their key on entry, and
+// the caller clears the map when the pointer leaves so the order snaps
+// back to reality.
 export function sortByUpdatedAtDesc(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
+  frozenKeys?: Map<string, number> | null,
 ): Conversation[] {
-  const effective = (c: Conversation): number =>
-    activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+  const effective = (c: Conversation): number => {
+    if (frozenKeys) {
+      const frozen = frozenKeys.get(c.id);
+      if (frozen !== undefined) return frozen;
+      // Capture the override value for the active row so dropping the
+      // override mid-hover (navigating to another chat) can't move it.
+      const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+      frozenKeys.set(c.id, live);
+      return live;
+    }
+    return activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+  };
   return [...conversations].sort((a, b) => effective(b) - effective(a));
 }
 
@@ -204,10 +311,7 @@ export interface SidebarDragSource {
     drop that landed on nothing droppable (e.g. "Shared with me", which is
     never a target — sessions can't be filed there). */
 export type SidebarDropTarget =
-  | { type: "project"; name: string }
-  | { type: "ungroup" }
-  | { type: "pin" }
-  | null;
+  { type: "project"; name: string } | { type: "ungroup" } | { type: "pin" } | null;
 
 /** The action a drop resolves to. `move` files the session into a project;
     `ungroup` removes it from its current project (the caller still confirms

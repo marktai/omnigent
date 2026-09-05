@@ -17,13 +17,18 @@ const { pinnedRef } = vi.hoisted(() => ({ pinnedRef: { current: [] as unknown[] 
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
+  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({ data: pinnedRef.current, isSuccess: true }),
+  usePinnedConversations: () => ({
+    data: { conversations: pinnedRef.current, filterHonored: true },
+    isSuccess: true,
+  }),
   useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
@@ -35,6 +40,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
