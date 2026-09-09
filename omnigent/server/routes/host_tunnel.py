@@ -760,6 +760,8 @@ async def _receive_loop(
                         "session",
                         {
                             "total": frame.total,
+                            "chunk_index": frame.chunk_index,
+                            "last_chunk": frame.last_chunk,
                             "external_session_id": s.external_session_id,
                             "workspace": s.workspace,
                             "items": s.items,

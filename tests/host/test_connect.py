@@ -5137,6 +5137,180 @@ async def test_handle_import_local_all_streams_a_frame_per_session(
     assert len(done_frames) == 1 and done_frames[0].status == "ok"
 
 
+async def test_handle_import_local_splits_oversized_session_into_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session past the server's chunk budget streams as ordered chunk frames."""
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    def _fake_ids(source: str, *, limit: int) -> list[str]:
+        return ["big"]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        # Ten ~1 KB items; a 2.5 KB budget forces several chunks.
+        items = [
+            SimpleNamespace(
+                type="message",
+                response_id=f"r{i}",
+                data=SimpleNamespace(model_dump=lambda **_kw: {"text": "x" * 1000}),
+            )
+            for i in range(10)
+        ]
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=items,
+            title="Big session",
+            source=source,
+        )
+
+    monkeypatch.setattr("omnigent.session_import.local.list_recent_local_session_ids", _fake_ids)
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_big", source="claude", limit=5, max_chunk_bytes=2500),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # Several contiguous chunks, all one session, index counting up.
+    assert len(session_frames) > 1
+    assert [f.chunk_index for f in session_frames] == list(range(len(session_frames)))
+    assert [f.last_chunk for f in session_frames] == [False] * (len(session_frames) - 1) + [True]
+    assert {f.session.external_session_id for f in session_frames} == {"big"}
+    # Every item lands exactly once, in order, split across the chunks.
+    all_items = [item for f in session_frames for item in f.session.items]
+    assert len(all_items) == 10
+    assert len(done_frames) == 1 and done_frames[0].status == "ok"
+
+
+async def test_handle_import_local_single_frame_when_no_chunk_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no budget (an older server) a big session still rides in one frame."""
+    from omnigent.host.frames import HostImportLocalSessionFrame, decode_host_frame
+
+    host = _make_host_process()
+
+    def _fake_ids(source: str, *, limit: int) -> list[str]:
+        return ["big"]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        items = [
+            SimpleNamespace(
+                type="message",
+                response_id=f"r{i}",
+                data=SimpleNamespace(model_dump=lambda **_kw: {"text": "x" * 1000}),
+            )
+            for i in range(10)
+        ]
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=items,
+            title="Big session",
+            source=source,
+        )
+
+    monkeypatch.setattr("omnigent.session_import.local.list_recent_local_session_ids", _fake_ids)
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        # max_chunk_bytes defaults to 0 — the older-server case.
+        HostImportLocalFrame(request_id="req_big", source="claude", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    assert len(session_frames) == 1
+    assert session_frames[0].chunk_index == 0 and session_frames[0].last_chunk is True
+    assert len(session_frames[0].session.items) == 10
+
+
+async def test_handle_import_local_exact_id_does_not_list_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact harness/id request loads that transcript without enumeration."""
+    from omnigent.host.frames import (
+        HostImportLocalByIdFrame,
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    def _unexpected_list(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("exact import must not enumerate local sessions")
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        assert (source, session_id) == ("codex", "session-exact")
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="Exact session",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _unexpected_list
+    )
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_local_session_ids", _unexpected_list
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalByIdFrame(
+            request_id="req_exact",
+            source="codex",
+            session_id="session-exact",
+        ),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+    assert [f.session.external_session_id for f in session_frames] == ["session-exact"]
+    assert session_frames[0].total == 1
+    assert len(done_frames) == 1 and done_frames[0].status == "ok"
+
+
 async def test_handle_import_local_reports_unreadable_sessions_as_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5190,5 +5364,70 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
 
     # Only the readable session got a frame; the corrupt one is counted, not sent.
     assert [f.session.external_session_id for f in session_frames] == ["good"]
+    assert len(done_frames) == 1
+    assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+
+
+async def test_handle_import_local_unexpected_error_skips_only_that_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected error loading one session must not abort the whole batch.
+
+    ``_load`` returns None for the expected read failures, but a surprise
+    exception type (here ``RuntimeError``) escapes it; the handler still has to
+    skip just that session and keep uploading the rest, ending status="ok".
+    """
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    # "bad" is streamed between two good sessions so a batch abort would drop
+    # the trailing "after" session.
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "before"), ("claude", "bad"), ("claude", "after")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        if session_id == "bad":
+            raise RuntimeError("normalizer blew up")
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="ok",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_boom", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # The batch runs (oldest first): both good sessions streamed, the bad one
+    # counted, and the stream closed cleanly rather than status="failed".
+    assert [f.session.external_session_id for f in session_frames] == ["after", "before"]
     assert len(done_frames) == 1
     assert done_frames[0].status == "ok" and done_frames[0].failed == 1

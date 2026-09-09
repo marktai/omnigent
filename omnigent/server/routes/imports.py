@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import secrets
 import threading
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import HostImportLocalFrame, encode_host_frame
+from omnigent.host.frames import HostImportLocalByIdFrame, HostImportLocalFrame, encode_host_frame
 from omnigent.native_coding_agents import native_coding_agent_for_harness
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
@@ -26,6 +27,7 @@ from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import resolve_project_session_create
 from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
+    IMPORT_CHUNK_MAX_BYTES,
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
     ImportSource,
@@ -67,6 +69,12 @@ class ImportSessionRequest(BaseModel):
     ``project_id`` files the imported session into a first-class project the
     caller owns, with the same ownership, default-fill, and mismatch-warning
     semantics as ``POST /v1/sessions``.
+
+    A session too large for one request body posts as several chunks sharing
+    one ``(source, external_session_id)``: ``chunk_index`` 0 creates the
+    conversation (honoring ``force``) and each later chunk appends its items to
+    it, with ``final`` set on the last. A default single-chunk request (``final``
+    true, ``chunk_index`` 0) is the whole session, exactly as before chunking.
     """
 
     source: ImportSource
@@ -76,6 +84,8 @@ class ImportSessionRequest(BaseModel):
     force: bool = False
     project_id: str | None = None
     items: list[ImportItemInput] = Field(min_length=1, max_length=_MAX_IMPORT_ITEMS)
+    chunk_index: int = Field(default=0, ge=0)
+    final: bool = True
 
     @field_validator("external_session_id")
     @classmethod
@@ -88,7 +98,12 @@ class ImportSessionRequest(BaseModel):
 
 
 class ImportSessionResponse(BaseModel):
-    """Result of importing or locating one source session."""
+    """Result of importing or appending to one source session.
+
+    ``item_count`` is the number of items this request persisted (the whole
+    session for a single-chunk import; one chunk's items for a chunked one, the
+    caller sums them for a total).
+    """
 
     session_id: str
     status: Literal["imported"]
@@ -96,11 +111,13 @@ class ImportSessionResponse(BaseModel):
 
 
 class LocalImportRequest(BaseModel):
-    """Request to import the caller's recent local harness sessions from a host.
+    """Request to import local harness sessions from a host.
 
     Unlike ``/imports`` (the CLI posts already-normalized items), the server
     asks the chosen host to read + normalize its own transcripts over the
-    tunnel — the transcripts live on the caller's machine, not the server.
+    tunnel — the transcripts live on the caller's machine, not the server. A
+    supplied ``session_id`` loads that exact session without enumerating any
+    local history.
     """
 
     host_id: str
@@ -108,6 +125,25 @@ class LocalImportRequest(BaseModel):
     # the host in one batch (each imported session keeps its own source).
     source: ImportSource | Literal["all"]
     limit: int = Field(default=10, ge=1, le=100)
+    session_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @field_validator("session_id")
+    @classmethod
+    def strip_session_id(cls, value: str | None) -> str | None:
+        """Reject an exact session id that is only whitespace."""
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("session_id must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def exact_import_needs_harness(self) -> LocalImportRequest:
+        """An id is only meaningful within one harness namespace."""
+        if self.session_id is not None and self.source == "all":
+            raise ValueError("an exact session import requires a specific harness")
+        return self
 
 
 class ImportedSessionRef(BaseModel):
@@ -136,6 +172,39 @@ class _ImportLockEntry:
 
     lock: asyncio.Lock
     users: int = 0
+
+
+@dataclass
+class _LocalImportTally:
+    """Running counts for one ``/imports/local`` batch."""
+
+    imported: int = 0
+    already_imported: int = 0
+    failed: int = 0
+    sessions: list[ImportedSessionRef] = field(default_factory=list)
+
+
+@dataclass
+class _InProgressImport:
+    """The session currently streaming in from a host, across its chunk frames.
+
+    A session over the chunk budget arrives as several frames; this holds its
+    conversation identity while the middle chunks append. Each terminal state
+    is tallied once: ``skip`` (already imported) counts at chunk 0, ``broken``
+    (a chunk failed) at the break, a healthy session at its last chunk.
+    """
+
+    conversation_id: str | None = None
+    external_id: str | None = None
+    title: str | None = None
+    item_count: int = 0
+    # A session is streaming (chunk 0 seen, last chunk not yet).
+    open: bool = False
+    # Already imported: drain its remaining chunks without persisting.
+    skip: bool = False
+    # A chunk failed to validate or persist: drain the rest; the partial
+    # conversation (if any) is deleted and the session tallied failed already.
+    broken: bool = False
 
 
 _IMPORT_LOCKS: dict[tuple[ImportSource, str], _ImportLockEntry] = {}
@@ -177,23 +246,42 @@ async def _stream_local_sessions_from_host(
     host_conn: HostConnection,
     source: str,
     limit: int,
+    session_id: str | None = None,
     stats: dict[str, int] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Yield the host's recent local sessions one at a time as they stream in.
+    """Yield requested local session chunks one at a time as they stream in.
 
     Sends a ``host.import_local`` frame and drains the per-request queue the
-    tunnel fills: each ``host.import_local_session`` frame yields one session
-    dict (``{total, external_session_id, workspace, items, title, source}``); the
-    terminal ``host.import_local_done`` ends the stream. The caller persists each
-    session as it arrives, so a large batch never buffers in one frame.
+    tunnel fills: each ``host.import_local_session`` frame yields one dict
+    (``{total, chunk_index, last_chunk, external_session_id, workspace, items,
+    title, source}``); the terminal ``host.import_local_done`` ends the stream.
+    A session that exceeds the request's ``max_chunk_bytes`` arrives as several
+    contiguous chunks sharing one ``external_session_id`` (``chunk_index``
+    counting up, ``last_chunk`` on the final one); a session that fits is a
+    single ``chunk_index=0`` / ``last_chunk=True`` dict. The caller appends each
+    chunk to the session's conversation as it arrives, so no session ever
+    buffers whole in one frame.
 
     :raises OmnigentError: If the host connection drops, a frame times out, or
         the host reports a read failure.
     """
     request_id = secrets.token_hex(8)
-    frame = encode_host_frame(
-        HostImportLocalFrame(request_id=request_id, source=source, limit=limit)
+    request_frame = (
+        HostImportLocalByIdFrame(
+            request_id=request_id,
+            source=source,
+            session_id=session_id,
+            max_chunk_bytes=IMPORT_CHUNK_MAX_BYTES,
+        )
+        if session_id is not None
+        else HostImportLocalFrame(
+            request_id=request_id,
+            source=source,
+            limit=limit,
+            max_chunk_bytes=IMPORT_CHUNK_MAX_BYTES,
+        )
     )
+    frame = encode_host_frame(request_frame)
     queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
     host_conn.pending_import_local[request_id] = queue
     try:
@@ -228,6 +316,146 @@ async def _stream_local_sessions_from_host(
                 return
     finally:
         host_conn.pending_import_local.pop(request_id, None)
+
+
+async def _consume_local_import_stream(
+    chunks: AsyncIterator[dict[str, Any]],
+    *,
+    conversation_store: ConversationStore,
+    persist_import: Callable[..., Awaitable[tuple[str, str | None]]],
+    user_id: str | None,
+    request_source: str,
+    stats: dict[str, int],
+) -> LocalImportResponse:
+    """Persist the host's streamed session chunks, appending oversized ones.
+
+    A session at or under the host's budget arrives as a single
+    ``chunk_index=0`` / ``last_chunk=True`` frame and imports whole; a larger
+    one arrives as contiguous chunks that share an ``external_session_id``, so
+    chunk 0 creates the conversation and each later chunk appends to it. Each
+    session lands one tally: an already-imported session counts at chunk 0, a
+    session broken by a bad chunk counts at the break (its partial conversation
+    deleted), a healthy one at its last chunk.
+    """
+    valid_sources = set(get_args(ImportSource))
+    tally = _LocalImportTally()
+    cur = _InProgressImport()
+
+    async def _abandon_partial() -> None:
+        """Delete a half-appended conversation so a broken session leaves none."""
+        if cur.conversation_id is not None:
+            with contextlib.suppress(Exception):
+                await conversation_store.delete_conversation(cur.conversation_id)
+
+    def _parse_items(raw_items: list[object]) -> list[NewConversationItem]:
+        items = [ImportItemInput.model_validate(raw).to_item() for raw in raw_items]
+        if cur.item_count + len(items) > _MAX_IMPORT_ITEMS:
+            raise ValueError("import exceeds item cap")
+        return items
+
+    async def _handle_chunk(chunk: dict[str, Any]) -> None:
+        nonlocal cur
+        chunk_index = chunk.get("chunk_index") or 0
+        last_chunk = bool(chunk.get("last_chunk", True))
+        external_session_id = chunk.get("external_session_id")
+        raw_items = chunk.get("items")
+        session_source = chunk.get("source")
+        source = (
+            session_source
+            if session_source in valid_sources
+            else (request_source if request_source in valid_sources else None)
+        )
+
+        if chunk_index == 0:
+            # A new session begins; any earlier one has ended (the host always
+            # finishes a session before starting the next).
+            cur = _InProgressImport(external_id=cast("str | None", external_session_id))
+            if (
+                not isinstance(external_session_id, str)
+                or not isinstance(raw_items, list)
+                or source is None
+            ):
+                tally.failed += 1
+                cur.broken = True
+                return
+            # Narrowed to a concrete harness (get_args excludes "all").
+            source = cast(ImportSource, source)
+            existing = await asyncio.to_thread(
+                conversation_store.find_imported_conversation, source, external_session_id
+            )
+            if existing is not None:
+                tally.already_imported += 1
+                cur.skip = True
+                return
+            try:
+                items = _parse_items(raw_items)
+                workspace = chunk.get("workspace")
+                native_title = chunk.get("title")
+                session_id, title = await persist_import(
+                    source=source,
+                    external_session_id=external_session_id,
+                    items=items,
+                    workspace=workspace if isinstance(workspace, str) else None,
+                    user_id=user_id,
+                    native_title=native_title if isinstance(native_title, str) else None,
+                )
+            except (OmnigentError, ValueError):
+                tally.failed += 1
+                cur.broken = True
+                return
+            cur.conversation_id = session_id
+            cur.title = title
+            cur.item_count = len(items)
+            cur.open = True
+        else:
+            # A continuation chunk: append to the session chunk 0 created.
+            if cur.skip or cur.broken or not cur.open:
+                return
+            try:
+                if not isinstance(raw_items, list):
+                    raise ValueError("chunk items must be a list")
+                items = _parse_items(raw_items)
+                assert cur.conversation_id is not None
+                await asyncio.to_thread(conversation_store.append, cur.conversation_id, items)
+            except (OmnigentError, ValueError):
+                tally.failed += 1
+                await _abandon_partial()
+                # Closed as broken: the finally-cleanup must not re-delete or
+                # re-count it.
+                cur.broken = True
+                cur.open = False
+                return
+            cur.item_count += len(items)
+
+        if last_chunk and cur.open:
+            assert cur.conversation_id is not None
+            tally.imported += 1
+            tally.sessions.append(
+                ImportedSessionRef(session_id=cur.conversation_id, title=cur.title)
+            )
+            cur.open = False
+
+    try:
+        async for chunk in chunks:
+            await _handle_chunk(chunk)
+    finally:
+        # A partial left open here is either a stream that raised mid-chunk
+        # (host drop) or a misbehaving host that never sent the last chunk;
+        # either way drop it so a retry re-imports cleanly rather than skipping
+        # a truncated conversation as already-imported.
+        if cur.open:
+            await _abandon_partial()
+            tally.failed += 1
+
+    # Fold in sessions the host enumerated but couldn't read, so the counts
+    # account for every target the user asked to import.
+    tally.failed += stats.get("host_failed", 0)
+    return LocalImportResponse(
+        imported=tally.imported,
+        already_imported=tally.already_imported,
+        failed=tally.failed,
+        sessions=tally.sessions,
+    )
 
 
 def create_imports_router(
@@ -346,7 +574,14 @@ def create_imports_router(
         request: Request,
         response: Response,
     ) -> ImportSessionResponse:
-        """Import one normalized transcript, optionally replacing its prior import."""
+        """Import one normalized transcript, optionally replacing its prior import.
+
+        A large session posts as several chunks: ``chunk_index`` 0 creates the
+        conversation (replacing any prior import when ``force``); each later
+        chunk appends its items to that conversation. The per-source lock
+        (``_serialize_source_import``) keeps concurrent imports of the same
+        session from interleaving their chunks.
+        """
         user_id = require_user(request, auth_provider)
         items = [item.to_item() for item in body.items]
         existing = await asyncio.to_thread(
@@ -354,6 +589,27 @@ def create_imports_router(
             body.source,
             body.external_session_id,
         )
+
+        if body.chunk_index > 0:
+            # Continuation of a chunked import: append to the conversation an
+            # earlier chunk created. A missing conversation means chunk 0 never
+            # landed (or was rolled back) — nothing to append to.
+            if existing is None:
+                raise OmnigentError(
+                    f"No in-progress import to append to for this {body.source} session",
+                    code=ErrorCode.CONFLICT,
+                )
+            await require_access(
+                user_id, existing.id, LEVEL_OWNER, permission_store, conversation_store
+            )
+            await asyncio.to_thread(conversation_store.append, existing.id, items)
+            response.status_code = 200
+            return ImportSessionResponse(
+                session_id=existing.id,
+                status="imported",
+                item_count=len(items),
+            )
+
         if existing is not None:
             await require_access(
                 user_id,
@@ -397,13 +653,13 @@ def create_imports_router(
         body: LocalImportRequest,
         request: Request,
     ) -> LocalImportResponse:
-        """Import the caller's recent local transcripts from a chosen host.
+        """Import local transcripts from a chosen host.
 
         The transcripts live on the caller's machine, so the read happens on
         the connected host over its tunnel — the server can't see them. The
-        host enumerates + normalizes the most recent sessions; the server
-        imports those not already imported. Drives the web "Import sessions"
-        button.
+        host loads an exact id or enumerates recent sessions, then normalizes
+        them; the server imports those not already imported. Drives the web
+        "Import sessions" button.
 
         Not atomic: each session is persisted as its frame arrives. If the host
         drops mid-stream this raises after the sessions read so far are already
@@ -424,80 +680,25 @@ def create_imports_router(
                 code=ErrorCode.CONFLICT,
             )
 
-        # Each session carries its own source (an "all" import mixes harnesses),
-        # falling back to the request source for a single-harness import.
-        valid_sources = set(get_args(ImportSource))
-        imported = 0
-        already_imported = 0
-        failed = 0
-        sessions: list[ImportedSessionRef] = []
-        # Set by the stream to the count of sessions the host couldn't read (no
-        # frame arrives for them); folded into ``failed`` after the loop.
+        # The host streams each session as one or more chunk frames; the
+        # consumer creates on chunk 0 and appends each later chunk (an oversized
+        # session), so nothing ever buffers a whole transcript here. ``stats``
+        # is filled by the stream on its done frame and read after it drains.
         stats: dict[str, int] = {}
-        # Persist each session as it streams in from the host (one frame each),
-        # rather than buffering the whole batch.
-        async for session in _stream_local_sessions_from_host(
-            host_registry=host_registry,
-            host_conn=host_conn,
-            source=body.source,
-            limit=body.limit,
+        return await _consume_local_import_stream(
+            _stream_local_sessions_from_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                source=body.source,
+                limit=body.limit,
+                session_id=body.session_id,
+                stats=stats,
+            ),
+            conversation_store=conversation_store,
+            persist_import=_persist_import,
+            user_id=user_id,
+            request_source=body.source,
             stats=stats,
-        ):
-            external_session_id = session.get("external_session_id")
-            raw_items = session.get("items")
-            session_source = session.get("source")
-            source = (
-                session_source
-                if session_source in valid_sources
-                else (body.source if body.source in valid_sources else None)
-            )
-            if (
-                not isinstance(external_session_id, str)
-                or not isinstance(raw_items, list)
-                or source is None
-                # Mirror the /imports item cap so one oversized transcript can't
-                # balloon a batch import's memory.
-                or len(raw_items) > _MAX_IMPORT_ITEMS
-            ):
-                failed += 1
-                continue
-            # The guard above rejected None and anything outside valid_sources
-            # (get_args(ImportSource), which excludes "all"), so this is a
-            # concrete harness — narrow off the request's ImportSource | "all".
-            source = cast(ImportSource, source)
-            existing = await asyncio.to_thread(
-                conversation_store.find_imported_conversation,
-                source,
-                external_session_id,
-            )
-            if existing is not None:
-                already_imported += 1
-                continue
-            try:
-                items = [ImportItemInput.model_validate(raw).to_item() for raw in raw_items]
-                workspace = session.get("workspace")
-                native_title = session.get("title")
-                session_id, title = await _persist_import(
-                    source=source,
-                    external_session_id=external_session_id,
-                    items=items,
-                    workspace=workspace if isinstance(workspace, str) else None,
-                    user_id=user_id,
-                    native_title=native_title if isinstance(native_title, str) else None,
-                )
-            except (OmnigentError, ValueError):
-                failed += 1
-                continue
-            imported += 1
-            sessions.append(ImportedSessionRef(session_id=session_id, title=title))
-        # Fold in sessions the host enumerated but couldn't read, so the counts
-        # account for every target the user asked to import.
-        failed += stats.get("host_failed", 0)
-        return LocalImportResponse(
-            imported=imported,
-            already_imported=already_imported,
-            failed=failed,
-            sessions=sessions,
         )
 
     return router

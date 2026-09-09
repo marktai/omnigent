@@ -5921,6 +5921,33 @@ class _SessionImportResult:
     raw_exc: BaseException | None = None
 
 
+def _server_supports_chunked_import(base_url: str) -> bool:
+    """Whether the server accepts an oversized session as append chunks.
+
+    Reads ``chunked_import_supported`` off ``GET /v1/info``. Any failure, or a
+    server old enough to lack the key, reads as ``False`` so the import falls
+    back to posting each session in one body (its historical behavior).
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    try:
+        resp = httpx.get(
+            f"{base_url}/v1/info",
+            headers=_remote_headers(server_url=base_url, host_id=None),
+            timeout=30.0,
+        )
+    except httpx.RequestError:
+        return False
+    if resp.is_error:
+        return False
+    try:
+        return bool(resp.json().get("chunked_import_supported", False))
+    except (ValueError, AttributeError):
+        return False
+
+
 @cli.command("import")
 @click.option(
     "--harness",
@@ -5990,8 +6017,11 @@ def import_session_command(
     from omnigent.chat import _remote_headers
     from omnigent.conversation_browser import conversation_url
     from omnigent.session_import import (
+        IMPORT_CHUNK_MAX_BYTES,
         ImportSource,
         SessionImportNotFoundError,
+        iter_item_chunks,
+        total_item_bytes,
     )
     from omnigent.session_import.local import (
         list_recent_local_session_ids,
@@ -6041,6 +6071,19 @@ def import_session_command(
         base_url = ensure_local_omnigent_server().url
     base_url = base_url.rstrip("/")
 
+    # A session larger than one body posts as append chunks, but only to a server
+    # that accepts them (older servers post whole, their historical behavior).
+    # The /v1/info probe is lazy — only a truly oversized session triggers it —
+    # and cached, so the common small-session import makes no extra request.
+    _probe_lock = threading.Lock()
+    _probe_cache: dict[str, bool] = {}
+
+    def _chunking_supported() -> bool:
+        with _probe_lock:
+            if "value" not in _probe_cache:
+                _probe_cache["value"] = _server_supports_chunked_import(base_url)
+            return _probe_cache["value"]
+
     def _import_one(target: tuple[ImportSource, str]) -> _SessionImportResult:
         # Each target carries its own harness so an "all" batch can span them.
         current_source, sid = target
@@ -6051,64 +6094,89 @@ def import_session_command(
         except (OSError, TypeError, ValueError) as exc:
             return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
 
-        payload = {
-            "source": imported.source,
-            "external_session_id": imported.external_session_id,
-            "workspace": imported.workspace,
-            "title": imported.native_title,
-            "force": force,
-            "items": [
-                {
-                    "type": item.type,
-                    "response_id": item.response_id,
-                    "data": item.data.model_dump(mode="json", exclude_none=True),
-                }
-                for item in imported.items
-            ],
-        }
-        try:
-            response = httpx.post(
-                f"{base_url}/v1/imports",
-                json=payload,
-                headers=_remote_headers(server_url=base_url, host_id=None),
-                timeout=120.0,
-            )
-        except httpx.RequestError as exc:
-            return _SessionImportResult(
-                sid,
-                "unreachable",
-                message=f"Could not reach the Omnigent server: {exc}",
-                raw_exc=exc,
-            )
+        item_dicts = [
+            {
+                "type": item.type,
+                "response_id": item.response_id,
+                "data": item.data.model_dump(mode="json", exclude_none=True),
+            }
+            for item in imported.items
+        ]
+        # Split only an oversized session, and only when the server accepts
+        # chunks; otherwise one body carries the whole session as before.
+        if total_item_bytes(item_dicts) > IMPORT_CHUNK_MAX_BYTES and _chunking_supported():
+            batches = list(iter_item_chunks(item_dicts))
+        else:
+            batches = [item_dicts]
+        chunked = len(batches) > 1
+        last = len(batches) - 1
 
-        if response.is_error:
+        session_id: str | None = None
+        total_items = 0
+        for index, batch in enumerate(batches):
+            payload: dict[str, object] = {
+                "source": imported.source,
+                "external_session_id": imported.external_session_id,
+                "items": batch,
+            }
+            if index == 0:
+                # Session metadata and the replace decision belong to the create
+                # chunk; later chunks only append.
+                payload["workspace"] = imported.workspace
+                payload["title"] = imported.native_title
+                payload["force"] = force
+            if chunked:
+                # Only a genuinely split session carries chunk markers, so a
+                # single-body import stays byte-identical to the pre-chunk wire.
+                payload["chunk_index"] = index
+                payload["final"] = index == last
             try:
-                body = response.json()
-                detail = body.get("error", {}).get("message") or body.get("detail")
-            except (ValueError, AttributeError):
-                detail = None
-            message = f"Import failed ({response.status_code}): {detail or response.text}"
-            status = "already" if response.status_code == 409 else "failed"
-            return _SessionImportResult(sid, status, message=message)
+                response = httpx.post(
+                    f"{base_url}/v1/imports",
+                    json=payload,
+                    headers=_remote_headers(server_url=base_url, host_id=None),
+                    timeout=120.0,
+                )
+            except httpx.RequestError as exc:
+                return _SessionImportResult(
+                    sid,
+                    "unreachable",
+                    message=f"Could not reach the Omnigent server: {exc}",
+                    raw_exc=exc,
+                )
 
-        try:
-            result = response.json()
-            session_id = result["session_id"]
-            item_count = result["item_count"]
-        except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            return _SessionImportResult(
-                sid,
-                "failed",
-                message="Import returned an invalid server response",
-                raw_exc=exc,
-            )
+            if response.is_error:
+                try:
+                    body = response.json()
+                    detail = body.get("error", {}).get("message") or body.get("detail")
+                except (ValueError, AttributeError):
+                    detail = None
+                message = f"Import failed ({response.status_code}): {detail or response.text}"
+                # Only the create chunk's 409 means "already imported"; a 409 on
+                # an append chunk is a real failure (its create was lost).
+                status = "already" if response.status_code == 409 and index == 0 else "failed"
+                return _SessionImportResult(sid, status, message=message)
+
+            try:
+                result = response.json()
+                session_id = result["session_id"]
+                total_items += result["item_count"]
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                return _SessionImportResult(
+                    sid,
+                    "failed",
+                    message="Import returned an invalid server response",
+                    raw_exc=exc,
+                )
+
+        assert session_id is not None
         # Surface the browser URL, not the bare id, so the user can open the
         # imported session straight into the web (where it offers the resume
         # picker). Maps a Databricks API base to its workspace SPA link.
         return _SessionImportResult(
             sid,
             "imported",
-            item_count=item_count,
+            item_count=total_items,
             link=conversation_url(base_url, session_id),
         )
 

@@ -515,20 +515,30 @@ export interface LocalImportResult {
 }
 
 /**
- * Import the caller's most recent local transcripts via `POST /v1/imports/local`.
+ * Import local transcripts via `POST /v1/imports/local`.
  * The chosen host reads + normalizes its own transcripts over the tunnel (the
  * transcripts live on that machine, not the server); already-imported sessions
- * are skipped. `source` is a specific harness or "all" for every harness at once.
+ * are skipped. Passing `sessionId` loads that exact session from `source`
+ * without listing local history. Otherwise, `source` may be "all" for every
+ * harness at once.
  */
 export async function importLocalSessions(
   hostId: string,
   source: ImportSourceSelector,
   limit: number,
+  sessionId?: string,
 ): Promise<LocalImportResult> {
+  const body: {
+    host_id: string;
+    source: ImportSourceSelector;
+    limit: number;
+    session_id?: string;
+  } = { host_id: hostId, source, limit };
+  if (sessionId !== undefined) body.session_id = sessionId;
   const res = await authenticatedFetch("/v1/imports/local", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
-    body: JSON.stringify({ host_id: hostId, source, limit }),
+    body: JSON.stringify(body),
   });
   const wire = await readJsonOrThrow<{
     imported: number;

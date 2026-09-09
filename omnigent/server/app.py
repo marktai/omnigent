@@ -140,6 +140,10 @@ class ServerInfoResponse(BaseModel):
     harness_install_enabled: bool
     installable_harnesses: list[str]
     dictation_available: bool
+    # Whether POST /v1/imports accepts an oversized session as chunk_index /
+    # final batches. Absent on older servers, so a client reads a missing key
+    # as False and posts each session in one body.
+    chunked_import_supported: bool
     branding: BrandingInfo
 
 
@@ -2169,6 +2173,7 @@ def create_app(
                 "harness_install_enabled": harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
+                "chunked_import_supported": True,
                 "branding": branding_snapshot.config(),
             }
         )

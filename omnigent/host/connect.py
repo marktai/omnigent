@@ -55,6 +55,7 @@ from omnigent.host.frames import (
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
+    HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
     HostImportLocalSessionFrame,
@@ -92,6 +93,7 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
+from omnigent.json_types import JsonObject
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -881,6 +883,49 @@ class _RunnerHandle:
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
     log_path: Path
     session_id: str | None = None
+
+
+def _chunk_session_frames(
+    *,
+    request_id: str,
+    total: int,
+    session: HostImportedLocalSession,
+    max_chunk_bytes: int,
+) -> list[HostImportLocalSessionFrame]:
+    """Split one loaded session into the frames that stream it to the server.
+
+    A session at or under the budget (or any session when the server sent no
+    budget — an older peer that can't reassemble) rides in one frame, exactly
+    as before chunking. A larger one splits its items into byte-bounded batches
+    that share its ``external_session_id``; each frame repeats the session
+    metadata and carries one batch, with ``chunk_index`` counting up and
+    ``last_chunk`` set on the final frame so the server appends in order.
+    """
+    from omnigent.session_import import iter_item_chunks, total_item_bytes
+
+    def _frame(
+        items: list[JsonObject], chunk_index: int, last_chunk: bool
+    ) -> HostImportLocalSessionFrame:
+        return HostImportLocalSessionFrame(
+            request_id=request_id,
+            total=total,
+            chunk_index=chunk_index,
+            last_chunk=last_chunk,
+            session=HostImportedLocalSession(
+                external_session_id=session.external_session_id,
+                workspace=session.workspace,
+                items=items,
+                title=session.title,
+                source=session.source,
+            ),
+        )
+
+    if max_chunk_bytes <= 0 or total_item_bytes(session.items) <= max_chunk_bytes:
+        return [_frame(session.items, chunk_index=0, last_chunk=True)]
+
+    batches = list(iter_item_chunks(session.items, max_bytes=max_chunk_bytes))
+    last = len(batches) - 1
+    return [_frame(batch, chunk_index=i, last_chunk=i == last) for i, batch in enumerate(batches)]
 
 
 class HostRetryableConnectionError(Exception):
@@ -2085,17 +2130,21 @@ class HostProcess:
         )
 
     async def _handle_import_local(
-        self, ws: websockets.asyncio.client.ClientConnection, frame: HostImportLocalFrame
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        frame: HostImportLocalFrame | HostImportLocalByIdFrame,
     ) -> None:
-        """Stream the host's recent local transcripts, one frame per session.
+        """Stream requested local transcripts, one frame per session.
 
-        The host owns the session files (``~/.claude`` etc.). It enumerates the
-        targets ("all" merges every harness into one global recency order, top
-        ``limit`` total), then reads + normalizes each and sends it immediately
+        The host owns the session files (``~/.claude`` etc.). An exact session
+        id is loaded directly; otherwise it enumerates the targets ("all"
+        merges every harness into one global recency order, top ``limit``
+        total). It reads + normalizes each and sends it immediately
         (``host.import_local_session``) so a large batch never rides in one frame
         and the server persists as each arrives. A terminal ``host.import_local_done``
-        closes the stream. Sessions that fail to load are skipped; a single-harness
-        enumeration failure fails the request.
+        closes the stream. A session that fails to load, normalize, or chunk is
+        skipped and counted so the rest of the batch still uploads; only a
+        single-harness enumeration failure fails the whole request.
         """
 
         def _targets() -> tuple[list[tuple[str, str]], str | None]:
@@ -2105,6 +2154,8 @@ class HostProcess:
             )
             from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
 
+            if isinstance(frame, HostImportLocalByIdFrame):
+                return [(frame.source, frame.session_id)], None
             if frame.source == "all":
                 return list(list_recent_sessions_across_harnesses(limit=frame.limit)), None
             source = cast(ImportSource, frame.source)
@@ -2156,19 +2207,36 @@ class HostProcess:
             total = len(ordered)
             load_failed = 0
             for source, session_id in ordered:
-                session = await asyncio.to_thread(_load, source, session_id)
-                if session is None:
+                try:
+                    session = await asyncio.to_thread(_load, source, session_id)
+                    chunks = (
+                        None
+                        if session is None
+                        else _chunk_session_frames(
+                            request_id=frame.request_id,
+                            total=total,
+                            session=session,
+                            max_chunk_bytes=frame.max_chunk_bytes,
+                        )
+                    )
+                except Exception:
+                    # One session's read/normalize/chunk blowing up must not drop
+                    # the rest of the batch — count it and move on so the remaining
+                    # sessions still upload. ws.send stays outside this guard: a
+                    # dead tunnel raises ConnectionClosed and should abort, not be
+                    # swallowed here as a skipped session.
+                    _logger.exception(
+                        "import_local: skipping session source=%r id=%r", source, session_id
+                    )
+                    load_failed += 1
+                    continue
+                if chunks is None:
                     # Unreadable/corrupt transcript: no frame to send, but report
                     # it on the done frame so the server's counts stay honest.
                     load_failed += 1
                     continue
-                await ws.send(
-                    encode_host_frame(
-                        HostImportLocalSessionFrame(
-                            request_id=frame.request_id, total=total, session=session
-                        )
-                    )
-                )
+                for chunk in chunks:
+                    await ws.send(encode_host_frame(chunk))
             await ws.send(
                 encode_host_frame(
                     HostImportLocalDoneFrame(
@@ -3836,7 +3904,7 @@ class HostProcess:
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
             await ws.send(encode_host_frame(options_result))
-        elif isinstance(frame, HostImportLocalFrame):
+        elif isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             # Streams one host.import_local_session per session (reads run off the
             # event loop inside), then a terminal host.import_local_done.
             await self._handle_import_local(ws, frame)

@@ -114,6 +114,65 @@ def test_import_command_sends_force_override(tmp_path: Path) -> None:
     assert "conv_replaced" in result.output
 
 
+def _write_large_claude_transcript(
+    home: Path, session_id: str, *, records: int, chars: int
+) -> None:
+    """Write a multi-record transcript whose normalized items exceed the chunk budget."""
+    transcript = home / ".claude" / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": f"user-{i}",
+                "cwd": "/repo",
+                "message": {"role": "user", "content": "x" * chars},
+            }
+        )
+        for i in range(records)
+    ]
+    transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+@respx.mock
+def test_import_command_chunks_oversized_session_when_server_supports_it(tmp_path: Path) -> None:
+    """A >2 MB session probes /v1/info, then posts create + append chunks."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def0aaaaaaaa"
+    # ~2.2 MB of normalized items forces at least two ~2 MB batches.
+    _write_large_claude_transcript(tmp_path, session_id, records=40, chars=60_000)
+
+    info = respx.get(f"{_BASE}/v1/info").mock(
+        return_value=httpx.Response(200, json={"chunked_import_supported": True})
+    )
+
+    def _respond(request: httpx.Request) -> httpx.Response:
+        final = json.loads(request.content).get("final")
+        return httpx.Response(
+            200 if final is False else 201,
+            json={"session_id": "conv_big", "status": "imported", "item_count": 1},
+        )
+
+    route = respx.post(f"{_BASE}/v1/imports").mock(side_effect=_respond)
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "claude", "--session", session_id],
+            env={"HOME": str(tmp_path)},
+        )
+
+    assert result.exit_code == 0, result.output
+    # The oversized session probed for chunk support, then split into >1 request.
+    assert info.called
+    assert route.call_count > 1
+    payloads = [json.loads(call.request.content) for call in route.calls]
+    assert [p["chunk_index"] for p in payloads] == list(range(len(payloads)))
+    assert payloads[0]["final"] is False and payloads[-1]["final"] is True
+    # Every chunk targets the one session; only the create chunk carries force.
+    assert {p["external_session_id"] for p in payloads} == {session_id}
+    assert "force" in payloads[0] and "force" not in payloads[-1]
+
+
 def test_import_command_rejects_cursor() -> None:
     """The import command rejects sources without a supported adapter."""
     result = CliRunner().invoke(

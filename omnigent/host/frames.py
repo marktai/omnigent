@@ -75,6 +75,7 @@ class HostFrameKind(str, Enum):
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
     IMPORT_LOCAL = "host.import_local"
+    IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
     IMPORT_LOCAL_DONE = "host.import_local_done"
 
@@ -894,20 +895,42 @@ class HostImportedLocalSession:
 
 @dataclass
 class HostImportLocalFrame:
-    """Server → host: read the host's recent local transcripts for a harness.
+    """Server → host: read recent local transcripts for a harness.
 
     The host owns the transcripts (``~/.claude`` etc.); the server can't see
-    them, so it asks the host to enumerate + normalize the most recent ones.
+    them, so it asks the host to enumerate and normalize the most recent ones.
 
     :param request_id: Unique id for correlating the result.
     :param source: Harness whose local sessions to read, e.g. ``"claude"``, or
         ``"all"`` to read every supported harness on the host in one batch.
     :param limit: Maximum number of most-recent sessions to return per harness.
+    :param max_chunk_bytes: When positive, the host may split an oversized
+        session across several ``host.import_local_session`` frames whose item
+        batches stay near this budget. ``0`` (an older server that can't
+        reassemble chunks) means send each session in one frame.
     """
 
     request_id: str
     source: str
     limit: int = 10
+    max_chunk_bytes: int = 0
+
+
+@dataclass
+class HostImportLocalByIdFrame:
+    """Server → host: read one known local transcript without listing.
+
+    :param request_id: Unique id for correlating the result.
+    :param source: Harness namespace containing the session.
+    :param session_id: Exact harness-native session id to load.
+    :param max_chunk_bytes: Chunking budget, same meaning as on
+        :class:`HostImportLocalFrame`.
+    """
+
+    request_id: str
+    source: str
+    session_id: str
+    max_chunk_bytes: int = 0
 
 
 @dataclass
@@ -918,14 +941,25 @@ class HostImportLocalSessionFrame:
     server persists each on arrival). ``total`` is the number of sessions the
     host expects to stream for this request, so the server can report progress.
 
+    A session larger than the request's ``max_chunk_bytes`` is split across
+    several frames sharing one ``session.external_session_id``: ``chunk_index``
+    counts them from 0 and ``last_chunk`` marks the final one, so the server
+    appends each batch to the same conversation. A session that fits sends one
+    frame with ``chunk_index=0`` and ``last_chunk=True`` (an older host that
+    never chunks always sends exactly that).
+
     :param request_id: Correlates to the :class:`HostImportLocalFrame`.
     :param total: Total sessions the host will stream for this request.
-    :param session: The normalized session to persist.
+    :param session: The normalized session (or one item batch of it) to persist.
+    :param chunk_index: 0-based position of this batch within its session.
+    :param last_chunk: Whether this is the session's final batch.
     """
 
     request_id: str
     total: int
     session: HostImportedLocalSession
+    chunk_index: int = 0
+    last_chunk: bool = True
 
 
 @dataclass
@@ -980,6 +1014,7 @@ HostFrame = (
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
     | HostImportLocalFrame
+    | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
     | HostImportLocalDoneFrame
 )
@@ -1351,6 +1386,17 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "source": frame.source,
                 "limit": frame.limit,
+                "max_chunk_bytes": frame.max_chunk_bytes,
+            }
+        )
+    if isinstance(frame, HostImportLocalByIdFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_BY_ID.value,
+                "request_id": frame.request_id,
+                "source": frame.source,
+                "session_id": frame.session_id,
+                "max_chunk_bytes": frame.max_chunk_bytes,
             }
         )
     if isinstance(frame, HostImportLocalSessionFrame):
@@ -1360,6 +1406,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.IMPORT_LOCAL_SESSION.value,
                 "request_id": frame.request_id,
                 "total": frame.total,
+                "chunk_index": frame.chunk_index,
+                "last_chunk": frame.last_chunk,
                 "session": {
                     "external_session_id": s.external_session_id,
                     "workspace": s.workspace,
@@ -1509,6 +1557,8 @@ def _decode_known_host_frame(
             return _decode_model_options_result(msg)
         case HostFrameKind.IMPORT_LOCAL:
             return _decode_import_local(msg)
+        case HostFrameKind.IMPORT_LOCAL_BY_ID:
+            return _decode_import_local_by_id(msg)
         case HostFrameKind.IMPORT_LOCAL_SESSION:
             return _decode_import_local_session(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
@@ -2041,6 +2091,17 @@ def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:
         request_id=_required_str(msg, "request_id"),
         source=_required_str(msg, "source"),
         limit=_required_int(msg, "limit"),
+        max_chunk_bytes=_optional_nonneg_int(msg, "max_chunk_bytes"),
+    )
+
+
+def _decode_import_local_by_id(msg: _JsonObject) -> HostImportLocalByIdFrame:
+    """Decode a host.import_local_by_id frame."""
+    return HostImportLocalByIdFrame(
+        request_id=_required_str(msg, "request_id"),
+        source=_required_str(msg, "source"),
+        session_id=_required_str(msg, "session_id"),
+        max_chunk_bytes=_optional_nonneg_int(msg, "max_chunk_bytes"),
     )
 
 
@@ -2070,11 +2131,21 @@ def _decode_imported_local_session(raw: object) -> HostImportedLocalSession:
 
 
 def _decode_import_local_session(msg: _JsonObject) -> HostImportLocalSessionFrame:
-    """Decode a host.import_local_session frame (one streamed session)."""
+    """Decode a host.import_local_session frame (one streamed session).
+
+    ``chunk_index`` / ``last_chunk`` are absent from hosts predating chunked
+    import; they default to a single complete chunk so an old host's one frame
+    decodes as a whole session.
+    """
+    last_chunk = msg.get("last_chunk", True)
+    if not isinstance(last_chunk, bool):
+        raise ValueError("frame field must be a bool: 'last_chunk'")
     return HostImportLocalSessionFrame(
         request_id=_required_str(msg, "request_id"),
         total=_required_int(msg, "total"),
         session=_decode_imported_local_session(msg.get("session")),
+        chunk_index=_optional_nonneg_int(msg, "chunk_index"),
+        last_chunk=last_chunk,
     )
 
 
@@ -2117,6 +2188,19 @@ def _required_int(msg: _JsonObject, key: str) -> int:
     val = msg.get(key)
     if not isinstance(val, int) or isinstance(val, bool):
         raise ValueError(f"frame missing required int field: {key!r}")
+    return val
+
+
+def _optional_nonneg_int(msg: _JsonObject, key: str) -> int:
+    """Return a non-negative int field, or 0 when absent/invalid.
+
+    Backward-compatible reader for fields added after the frame shipped: an
+    older peer omits them, so a missing or malformed value reads as 0 rather
+    than failing decode. Negative values are clamped to 0.
+    """
+    val = msg.get(key)
+    if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+        return 0
     return val
 
 

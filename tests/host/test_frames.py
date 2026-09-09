@@ -20,6 +20,7 @@ from omnigent.host.frames import (
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
+    HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
     HostImportLocalSessionFrame,
@@ -56,6 +57,21 @@ def test_import_local_frames_round_trip() -> None:
         encode_host_frame(HostImportLocalFrame(request_id="req_imp", source="claude", limit=3))
     )
     assert request == HostImportLocalFrame(request_id="req_imp", source="claude", limit=3)
+
+    exact_request = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalByIdFrame(
+                request_id="req_exact",
+                source="codex",
+                session_id="0198d07d-session",
+            )
+        )
+    )
+    assert exact_request == HostImportLocalByIdFrame(
+        request_id="req_exact",
+        source="codex",
+        session_id="0198d07d-session",
+    )
 
     session = decode_host_frame(
         encode_host_frame(
@@ -107,6 +123,76 @@ def test_import_local_frames_round_trip() -> None:
     )
     assert isinstance(done_failed, HostImportLocalDoneFrame)
     assert done_failed.failed == 2
+
+
+def test_import_local_chunk_fields_round_trip_and_backfill() -> None:
+    """Chunk-import fields survive the tunnel and default sanely for old peers."""
+    # Request frames carry the server's chunk budget.
+    req = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalFrame(
+                request_id="r", source="claude", limit=3, max_chunk_bytes=2_097_152
+            )
+        )
+    )
+    assert isinstance(req, HostImportLocalFrame)
+    assert req.max_chunk_bytes == 2_097_152
+
+    by_id = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalByIdFrame(
+                request_id="r", source="codex", session_id="s", max_chunk_bytes=4096
+            )
+        )
+    )
+    assert isinstance(by_id, HostImportLocalByIdFrame)
+    assert by_id.max_chunk_bytes == 4096
+
+    # A non-final session chunk round-trips its index and last-chunk flag.
+    mid = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalSessionFrame(
+                request_id="r",
+                total=1,
+                chunk_index=2,
+                last_chunk=False,
+                session=HostImportedLocalSession(
+                    external_session_id="s1", workspace=None, items=[], title=None, source="claude"
+                ),
+            )
+        )
+    )
+    assert isinstance(mid, HostImportLocalSessionFrame)
+    assert mid.chunk_index == 2 and mid.last_chunk is False
+
+    # An older peer omits the new keys: a request reads a 0 budget (don't chunk)
+    # and a session frame reads one complete chunk.
+    old_req = decode_host_frame(
+        json.dumps(
+            {"kind": "host.import_local", "request_id": "r", "source": "claude", "limit": 3}
+        )
+    )
+    assert isinstance(old_req, HostImportLocalFrame)
+    assert old_req.max_chunk_bytes == 0
+
+    old_session = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.import_local_session",
+                "request_id": "r",
+                "total": 1,
+                "session": {
+                    "external_session_id": "s1",
+                    "workspace": None,
+                    "items": [],
+                    "title": None,
+                    "source": "claude",
+                },
+            }
+        )
+    )
+    assert isinstance(old_session, HostImportLocalSessionFrame)
+    assert old_session.chunk_index == 0 and old_session.last_chunk is True
 
 
 def test_model_options_frames_round_trip() -> None:
