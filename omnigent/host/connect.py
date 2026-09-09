@@ -2243,8 +2243,9 @@ class HostProcess:
         total). It reads + normalizes each and sends it immediately
         (``host.import_local_session``) so a large batch never rides in one frame
         and the server persists as each arrives. A terminal ``host.import_local_done``
-        closes the stream. Sessions that fail to load are skipped; a single-harness
-        enumeration failure fails the request.
+        closes the stream. A session that fails to load or normalize is skipped
+        and counted so the rest of the batch still uploads; only a single-harness
+        enumeration failure fails the whole request.
         """
 
         def _targets() -> tuple[list[tuple[str, str]], str | None]:
@@ -2307,7 +2308,19 @@ class HostProcess:
             total = len(ordered)
             load_failed = 0
             for source, session_id in ordered:
-                session = await asyncio.to_thread(_load, source, session_id)
+                try:
+                    session = await asyncio.to_thread(_load, source, session_id)
+                except Exception:
+                    # One session's read/normalize blowing up must not drop the
+                    # rest of the batch — count it and move on so the remaining
+                    # sessions still upload. ws.send stays outside this guard: a
+                    # dead tunnel raises ConnectionClosed and should abort, not be
+                    # swallowed here as a skipped session.
+                    _logger.exception(
+                        "import_local: skipping session source=%r id=%r", source, session_id
+                    )
+                    load_failed += 1
+                    continue
                 if session is None:
                     # Unreadable/corrupt transcript: no frame to send, but report
                     # it on the done frame so the server's counts stay honest.

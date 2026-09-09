@@ -5725,6 +5725,71 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
     assert done_frames[0].status == "ok" and done_frames[0].failed == 1
 
 
+async def test_handle_import_local_unexpected_error_skips_only_that_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected error loading one session must not abort the whole batch.
+
+    ``_load`` returns None for the expected read failures, but a surprise
+    exception type (here ``RuntimeError``) escapes it; the handler still has to
+    skip just that session and keep uploading the rest, ending status="ok".
+    """
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    # "bad" is streamed between two good sessions so a batch abort would drop
+    # the trailing "after" session.
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "before"), ("claude", "bad"), ("claude", "after")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        if session_id == "bad":
+            raise RuntimeError("normalizer blew up")
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="ok",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_boom", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # The batch runs (oldest first): both good sessions streamed, the bad one
+    # counted, and the stream closed cleanly rather than status="failed".
+    assert [f.session.external_session_id for f in session_frames] == ["after", "before"]
+    assert len(done_frames) == 1
+    assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+
+
 async def test_dispatch_fs_write_op_routes_github_set_preference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
