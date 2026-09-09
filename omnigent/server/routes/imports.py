@@ -420,8 +420,7 @@ def create_imports_router(
         user_id = require_user(request, auth_provider)
         items = [item.to_item() for item in body.items]
         existing = await asyncio.to_thread(
-            conversation_store.find_imported_conversation,
-            body.source,
+            conversation_store.find_conversation_by_external_session_id,
             body.external_session_id,
         )
         if existing is not None:
@@ -433,8 +432,10 @@ def create_imports_router(
                 conversation_store,
             )
             if not body.force:
+                # Matches a prior import or a native run of the same session
+                # (both record the external id), so "exists", not "imported".
                 raise OmnigentError(
-                    f"This {body.source} session has already been imported as {existing.id}",
+                    f"This {body.source} session already exists as {existing.id}",
                     code=ErrorCode.CONFLICT,
                 )
 
@@ -539,8 +540,7 @@ def create_imports_router(
             # concrete harness — narrow off the request's ImportSource | "all".
             source = cast(ImportSource, source)
             existing = await asyncio.to_thread(
-                conversation_store.find_imported_conversation,
-                source,
+                conversation_store.find_conversation_by_external_session_id,
                 external_session_id,
             )
             if existing is not None:
