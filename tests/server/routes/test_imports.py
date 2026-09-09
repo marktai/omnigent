@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from types import SimpleNamespace
@@ -119,6 +120,101 @@ async def test_import_session_uses_native_title_when_supplied(
     )
     assert conversation is not None
     assert conversation.title == "My renamed thread"
+
+
+def _import_item(text: str = "hi") -> dict:
+    return {
+        "type": "message",
+        "response_id": "claude:turn-1",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+    }
+
+
+@contextlib.asynccontextmanager
+async def _authed_imports_client(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, *, user_id: str = "user-test"
+):
+    """An imports-router client whose caller is a fixed authenticated user.
+
+    ``project_name`` needs an owner for the created project, so the shared
+    no-auth ``client`` fixture (user ``None``) can't exercise it — pin a user by
+    monkeypatching ``require_user`` and wire a real project store.
+    """
+    from fastapi import FastAPI
+
+    from omnigent.server.routes import imports as imports_module
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    project_store = SqlAlchemyProjectStore(db_uri)
+    monkeypatch.setattr(imports_module, "require_user", lambda request, auth_provider: user_id)
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            SqlAlchemyConversationStore(db_uri),
+            SqlAlchemyAgentStore(db_uri),
+            project_store=project_store,
+        ),
+        prefix="/v1",
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c, project_store
+
+
+async def test_import_session_files_into_named_project(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``project_name`` find-or-creates a project and files the session into it;
+    a second import with the same name reuses that one project."""
+    _seed_claude_agent(db_uri)
+
+    def _body(sid: str) -> dict:
+        return {
+            "source": "claude",
+            "external_session_id": sid,
+            "project_name": "Imported chats",
+            "items": [_import_item()],
+        }
+
+    async with _authed_imports_client(db_uri, monkeypatch) as (client, project_store):
+        first = await client.post("/v1/imports", json=_body("named-proj-1"))
+        second = await client.post("/v1/imports", json=_body("named-proj-2"))
+    assert first.status_code == 201 and second.status_code == 201
+
+    store = SqlAlchemyConversationStore(db_uri)
+    project_id = store.get_conversation(first.json()["session_id"]).project_id
+    assert project_id is not None
+    # The second import reuses the project rather than creating a duplicate.
+    assert store.get_conversation(second.json()["session_id"]).project_id == project_id
+    project = project_store.get(project_id, user_id="user-test")
+    assert project is not None and project.name == "Imported chats"
+    assert [p.name for p in project_store.list(user_id="user-test")].count("Imported chats") == 1
+
+
+async def test_import_session_without_project_name_files_no_project(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting ``project_name`` imports with no project (old-client shape), and
+    an unknown extra field is ignored rather than 422'd (forward compatibility)."""
+    _seed_claude_agent(db_uri)
+    payload = {
+        "source": "claude",
+        "external_session_id": "no-project-1",
+        # A field a newer client might send; the server must ignore it, not 422.
+        "unknown_future_field": "ignored",
+        "items": [_import_item()],
+    }
+
+    async with _authed_imports_client(db_uri, monkeypatch) as (client, _project_store):
+        created = await client.post("/v1/imports", json=payload)
+    assert created.status_code == 201
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(
+        created.json()["session_id"]
+    )
+    assert conversation is not None
+    assert conversation.project_id is None
 
 
 async def test_concurrent_identical_imports_return_one_session(
