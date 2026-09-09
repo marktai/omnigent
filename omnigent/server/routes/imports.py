@@ -134,6 +134,9 @@ class LocalImportRequest(BaseModel):
     source: ImportSource | Literal["all"]
     limit: int = Field(default=10, ge=1, le=100)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    # File every session in this batch into the caller's project of this name,
+    # find-or-created (same semantics as /imports project_name).
+    project_name: str | None = Field(default=None, max_length=100)
 
     @field_validator("session_id")
     @classmethod
@@ -547,6 +550,9 @@ def create_imports_router(
         counts["imported"] = 0
         counts["already_imported"] = 0
         counts["failed"] = 0
+        # Resolve the batch's target project once; every imported session in the
+        # batch is filed into it.
+        project_id = await _resolve_project(project_name=body.project_name, user_id=user_id)
         # Set by the stream to the count of sessions the host couldn't read (no
         # frame arrives for them); folded into ``failed`` after the loop.
         stats: dict[str, int] = {}
@@ -599,6 +605,7 @@ def create_imports_router(
                     workspace=workspace if isinstance(workspace, str) else None,
                     user_id=user_id,
                     native_title=native_title if isinstance(native_title, str) else None,
+                    project_id=project_id,
                     host_id=body.host_id,
                 )
             except (OmnigentError, ValueError):

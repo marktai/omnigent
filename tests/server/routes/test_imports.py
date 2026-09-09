@@ -569,6 +569,74 @@ async def test_local_import_binds_session_to_importing_host(
     assert unbound.workspace is None
 
 
+async def test_local_import_files_batch_into_named_project(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``project_name`` on a host-mediated import files every session in the
+    batch into one find-or-created project."""
+    from fastapi import FastAPI
+
+    from omnigent.server.routes import imports as imports_module
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    _seed_claude_agent(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    project_store = SqlAlchemyProjectStore(db_uri)
+
+    async def _fake_stream(**_kwargs: object):
+        for sid in ("host-proj-1", "host-proj-2"):
+            yield {
+                "external_session_id": sid,
+                "workspace": None,
+                "items": [_import_item()],
+                "title": sid,
+                "source": "claude",
+            }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+    monkeypatch.setattr(imports_module, "require_user", lambda request, auth_provider: "user-test")
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    host_registry = SimpleNamespace(get=lambda host_id: host_conn)
+    host_store = SimpleNamespace(get_host=lambda host_id: SimpleNamespace(user_id="user-test"))
+
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            conversation_store,
+            SqlAlchemyAgentStore(db_uri),
+            project_store=project_store,
+            host_registry=host_registry,  # type: ignore[arg-type]
+            host_store=host_store,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/v1/imports/local",
+            json={
+                "host_id": "host_0123456789abcdef0123456789abcdef",
+                "source": "claude",
+                "limit": 5,
+                "project_name": "Host batch",
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["imported"] == 2
+    named = [p for p in project_store.list(user_id="user-test") if p.name == "Host batch"]
+    assert len(named) == 1
+    project_id = named[0].id
+    for sid in ("host-proj-1", "host-proj-2"):
+        conv = conversation_store.find_imported_conversation("claude", sid)
+        assert conv is not None and conv.project_id == project_id
+
+
 async def test_local_import_stream_emits_ndjson_session_then_done(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
