@@ -133,23 +133,33 @@ def test_omnigent_error_category_defaults_from_code() -> None:
 
 
 def test_omnigent_error_category_override() -> None:
-    """The override wins, for a code whose cause is context-dependent.
+    """The override wins over the code's default category.
 
-    A schema-layer INVALID_INPUT is a client bug, not the user's typo.
+    A NOT_FOUND raised while the server itself generated a bad id is a server
+    fault, not the user's stale reference.
     """
     err = OmnigentError(
-        "bad request body",
-        code=ErrorCode.INVALID_INPUT,
-        category=ErrorCategory.CLIENT,
+        "internally generated id not found",
+        code=ErrorCode.NOT_FOUND,
+        category=ErrorCategory.SERVER,
     )
-    assert err.category is ErrorCategory.CLIENT
+    assert err.category is ErrorCategory.SERVER
     # The code's default is still USER when not overridden.
-    assert category_for_code(ErrorCode.INVALID_INPUT) is ErrorCategory.USER
+    assert category_for_code(ErrorCode.NOT_FOUND) is ErrorCategory.USER
 
 
 def test_category_for_unknown_code_is_unknown() -> None:
     """A code outside the ErrorCode namespace attributes to UNKNOWN."""
     assert category_for_code("not_a_real_code") is ErrorCategory.UNKNOWN
+
+
+def test_category_taxonomy_is_topology_aware() -> None:
+    """The owner set models deployment topology: host and runner are first-class,
+    and the ambiguous ``client`` bucket is gone."""
+    values = {c.value for c in ErrorCategory}
+    assert {"host", "runner"} <= values
+    assert "client" not in values
+    assert not hasattr(ErrorCategory, "CLIENT")
 
 
 def test_every_error_code_has_an_impact() -> None:

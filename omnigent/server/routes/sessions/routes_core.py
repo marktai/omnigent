@@ -455,10 +455,10 @@ def register_core_routes(
             launch_result = {"status": "failed", "error": "host launch timed out"}
         launch_failed = launch_result.get("status") == "failed"
         if launch_failed:
-            # No structured error_code on this generic launch-failure path, so
-            # the specific owner is unknown; it does block the session from
-            # starting. Coded failures (harness_not_configured, etc.) are
-            # attributed where they raise as OmnigentError.
+            # The runner failed to come up (generic launch-failure path with no
+            # structured error_code), blocking the session at launch. A coded
+            # deployment failure (harness_not_configured, etc.) is attributed
+            # CONFIG where it raises as OmnigentError.
             _logger.warning(
                 "Host %s failed to launch runner for session %s: %s",
                 host_id,
@@ -467,7 +467,7 @@ def register_core_routes(
                 extra=debug_event(
                     "runner_launch_failed",
                     session_id=session_id,
-                    error_category=ErrorCategory.UNKNOWN.value,
+                    error_category=ErrorCategory.RUNNER.value,
                     error_impact=ErrorImpact.BLOCKING.value,
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),

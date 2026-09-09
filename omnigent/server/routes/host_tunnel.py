@@ -602,8 +602,8 @@ async def _receive_loop(
             # One-way report: a runner this host spawned died unexpectedly. Stash
             # the cause so the runner status endpoint can answer "offline, and
             # here is why" to the client still waiting for the runner to connect.
-            # The cause is a free-text tail we have not parsed, so the owner is
-            # unknown; it blocks that waiting client.
+            # A runner-process fault; the free-text cause is unparsed, so the
+            # lifecycle stage is unknown.
             _logger.warning(
                 "Host %s reported runner %s exited: %s",
                 host_id,
@@ -613,7 +613,7 @@ async def _receive_loop(
                     "runner_exited",
                     host_id=host_id,
                     runner_id=frame.runner_id,
-                    error_category=ErrorCategory.UNKNOWN.value,
+                    error_category=ErrorCategory.RUNNER.value,
                     error_impact=ErrorImpact.BLOCKING.value,
                     # The runner may have died before or during a turn; the host
                     # can't tell from the exit alone.

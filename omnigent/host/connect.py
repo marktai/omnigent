@@ -2132,8 +2132,9 @@ class HostProcess:
             _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-        # A non-zero runner exit blocks the session; the cause lives in the
-        # unparsed log tail, so the owner and lifecycle stage are unknown.
+        # A non-zero runner exit is a runner-process fault that blocks the
+        # session; the specific cause lives in the unparsed log tail (lifecycle
+        # stage unknown).
         _logger.warning(
             "Runner %s died unexpectedly: %s",
             runner_id,
@@ -2141,7 +2142,7 @@ class HostProcess:
             extra=debug_event(
                 "runner_died",
                 runner_id=runner_id,
-                error_category=ErrorCategory.UNKNOWN.value,
+                error_category=ErrorCategory.RUNNER.value,
                 error_impact=ErrorImpact.BLOCKING.value,
                 error_phase=ErrorPhase.UNKNOWN.value,
             ),

@@ -21,12 +21,17 @@ class ErrorCategory(str, Enum):
     queryable ``error_category`` so failures can be split by owner for
     fault-share, alerting, and remediation.
 
-    :cvar USER: The human's input, choice, or action. Declined an elicitation, a
-        bad path, a stale id, deleted their own workspace, a prompt too large.
-        Working as designed; no software fix.
-    :cvar CLIENT: The calling software (web UI, SDK, integration) formed a bad
-        request: wrong shape, missing field, a token it held but dropped. A
-        correct client would not hit it.
+    :cvar USER: The human's input, choice, or action, including a malformed
+        request from their client. Declined an elicitation, a bad path, a stale
+        id, deleted their own workspace, a prompt too large, a schema-invalid
+        request body. Working as designed; no software fix.
+    :cvar HOST: The host daemon (the machine-side process that spawns runners and
+        owns workspace/harness state): its tunnel dropped, a frame handler
+        crashed, a readiness probe failed.
+    :cvar RUNNER: The runner process (which runs the harness and executes turns):
+        it crashed, exited nonzero, failed to launch, or its tunnel went silent.
+        Distinct from CONFIG, which is "a runner was never provisioned"; RUNNER
+        is "a runner existed and failed".
     :cvar CONFIG: Deployment, credentials, or install is wrong or incomplete: no
         runner deployed, harness not configured, a bad provider key.
     :cvar SERVER: Our bug or internal/infra failure, at a site that knows the
@@ -40,7 +45,8 @@ class ErrorCategory(str, Enum):
     """
 
     USER = "user"
-    CLIENT = "client"
+    HOST = "host"
+    RUNNER = "runner"
     CONFIG = "config"
     SERVER = "server"
     UPSTREAM = "upstream"
@@ -236,9 +242,8 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
 # entry; a test asserts it so a new code cannot merge uncategorized.
 _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A human presented no credential, lacks permission, or referenced something
-    # absent or already-taken. INVALID_INPUT defaults to user (a business-rule
-    # rejection of a well-formed request); the schema/transport layer raises it
-    # with category=CLIENT instead (a malformed request is the caller's bug).
+    # absent or already-taken. All caller-side: USER covers both a business-rule
+    # rejection of a well-formed request and a schema-invalid request body.
     ErrorCode.UNAUTHORIZED: ErrorCategory.USER,
     ErrorCode.FORBIDDEN: ErrorCategory.USER,
     ErrorCode.NOT_FOUND: ErrorCategory.USER,

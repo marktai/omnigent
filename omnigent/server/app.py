@@ -1913,20 +1913,19 @@ def create_app(
     ) -> JSONResponse:
         """Attribute schema-validation rejections, then return the stock 422 body.
 
-        A request that fails schema/transport validation is the calling
-        software's bug, not the human's (category=client), and it rejects one
-        request without harming the session (impact=benign). Attribution rides
-        the per-request audit row rather than a dedicated ERROR/WARN line; the
-        response is delegated to FastAPI's default handler so the 422 shape is
-        unchanged.
+        A schema/transport-invalid request is caller-side input (category=user),
+        and it rejects one request without harming the session (impact=benign).
+        Attribution rides the per-request audit row rather than a dedicated
+        ERROR/WARN line; the response is delegated to FastAPI's default handler
+        so the 422 shape is unchanged.
         """
         # Attribute on the per-request audit row, not the ERROR stream: a schema
-        # rejection is a client fault but expected and low-signal, so it should be
+        # rejection is expected, low-signal caller input, so it should be
         # queryable without adding noise where the 500s must stand out.
         add_audit_attrs(
             code=str(ErrorCode.INVALID_INPUT),
             http_status="422",
-            error_category=ErrorCategory.CLIENT.value,
+            error_category=ErrorCategory.USER.value,
             error_impact=ErrorImpact.BENIGN.value,
             error_phase=ErrorPhase.REQUEST.value,
         )
@@ -1953,12 +1952,12 @@ def create_app(
         :returns: 404 for a malformed id, otherwise a 500 JSON response.
         """
         if isinstance(exc.orig, InvalidUuidError):
-            # A malformed id is the caller sending a value no row can ever
-            # address, not a human referencing a real-but-gone one.
+            # A malformed id is caller-side input (a value no row can ever
+            # address), not a human referencing a real-but-gone one.
             add_audit_attrs(
                 code=str(ErrorCode.NOT_FOUND),
                 http_status="404",
-                error_category=ErrorCategory.CLIENT.value,
+                error_category=ErrorCategory.USER.value,
                 error_impact=ErrorImpact.BENIGN.value,
                 error_phase=ErrorPhase.REQUEST.value,
             )

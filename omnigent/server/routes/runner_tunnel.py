@@ -760,7 +760,7 @@ async def _ping_loop(
                 elapsed,
                 extra=debug_event(
                     "runner_ping_timeout",
-                    error_category=ErrorCategory.UPSTREAM.value,
+                    error_category=ErrorCategory.RUNNER.value,
                     error_impact=ErrorImpact.BLOCKING.value,
                     error_phase=ErrorPhase.UNKNOWN.value,
                 ),
