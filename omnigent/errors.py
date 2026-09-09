@@ -439,6 +439,10 @@ class ElicitationDeclinedError(Exception):
 
 # Exception type names (matched across the MRO) treated as a transient upstream
 # transport blip. Matched by name so this module imports no httpx / starlette.
+# Best-effort and deliberately coarse: a same-named exception from unrelated code
+# (e.g. urllib's HTTPError on a fetch that is really our bug) mis-buckets as
+# upstream. Acceptable for an aggregate fault-share signal, not an exact ledger;
+# a raise site that knows better raises OmnigentError with explicit axes.
 _TRANSPORT_EXC_NAMES = frozenset(
     {
         "HTTPError",
@@ -474,6 +478,9 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
     """
     if isinstance(exc, OmnigentError):
         return exc.category, exc.impact
+    # ConnectionError/TimeoutError are OSError subclasses: this also catches an
+    # internal asyncio timeout on a slow server-side call (really ours) as
+    # upstream. Same best-effort trade-off as the name set below.
     if isinstance(exc, (ConnectionError, TimeoutError)):
         return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
     if _TRANSPORT_EXC_NAMES.intersection(klass.__name__ for klass in type(exc).__mro__):

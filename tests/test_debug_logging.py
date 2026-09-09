@@ -307,6 +307,30 @@ def test_no_phase_when_no_code_and_no_scope() -> None:
     assert "error_phase" not in attrs
 
 
+def test_benign_row_in_phase_scope_is_not_stamped() -> None:
+    """A non-error log line inside a phase_scope must NOT inherit error_phase.
+
+    phase_scope wraps the whole turn loop, so benign INFO/DEBUG telemetry (and
+    high-volume SSE-event rows) flow through here. Stamping them would pollute
+    the error_phase column, so only rows that are actually errors (an exception,
+    or an explicit category/impact) get located.
+    """
+    from omnigent.errors import ErrorPhase
+
+    with dl.phase_scope(ErrorPhase.TURN):
+        info = logging.LogRecord("omnigent.runtime.x", logging.INFO, __file__, 1, "hi", (), None)
+        info_attrs = dl.record_to_row(info, source="runner")["attributes"]
+        # A bare WARNING with no exception and no explicit error attrs is not an
+        # error row either; it stays clean.
+        warn = logging.LogRecord(
+            "omnigent.runtime.x", logging.WARNING, __file__, 1, "hm", (), None
+        )
+        warn_attrs = dl.record_to_row(warn, source="runner")["attributes"]
+    assert "error_phase" not in info_attrs
+    assert "error_category" not in info_attrs
+    assert "error_phase" not in warn_attrs
+
+
 def test_debug_event_builds_extra() -> None:
     assert dl.debug_event("evt", a=1, b="x") == {
         "event_name": "evt",

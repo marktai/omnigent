@@ -599,13 +599,11 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostRunnerExitedFrame):
-            # One-way report: a runner this host spawned died
-            # unexpectedly. Stash the cause so the runner status
-            # endpoint can answer "offline, and here is why" to the
-            # client still waiting for the runner to connect.
-            # A runner this host spawned died; the cause lives in the free-text
-            # tail we have not parsed, so the owner is unknown. It blocks a client
-            # waiting for that runner to connect.
+            # One-way report: a runner this host spawned died unexpectedly. Stash
+            # the cause so the runner status endpoint can answer "offline, and
+            # here is why" to the client still waiting for the runner to connect.
+            # The cause is a free-text tail we have not parsed, so the owner is
+            # unknown; it blocks that waiting client.
             _logger.warning(
                 "Host %s reported runner %s exited: %s",
                 host_id,

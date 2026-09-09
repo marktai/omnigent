@@ -287,11 +287,6 @@ def current_session_id() -> str | None:
     return _session_id_var.get() or None
 
 
-def set_current_phase(phase: ErrorPhase | None) -> None:
-    """Bind the ambient lifecycle phase for subsequently logged errors."""
-    _phase_var.set(phase)
-
-
 @contextlib.contextmanager
 def phase_scope(phase: ErrorPhase) -> Iterator[None]:
     """Mark *phase* as active for the block, restoring the prior value on exit.
@@ -479,7 +474,12 @@ def _stamp_error_dimensions(attrs: dict[str, str], record: logging.LogRecord) ->
         category, impact = classify_exception(exc)
         attrs.setdefault("error_category", category.value)
         attrs.setdefault("error_impact", impact.value)
-    if "error_phase" not in attrs:
+    # Locate only rows that are actually errors: an exception to place, or a row
+    # already declaring itself an error via category/impact. Otherwise a benign
+    # INFO/DEBUG line emitted inside a phase_scope (the whole turn loop is one)
+    # would inherit a spurious error_phase from the ambient scope.
+    is_error_row = exc is not None or "error_category" in attrs or "error_impact" in attrs
+    if is_error_row and "error_phase" not in attrs:
         phase = _resolve_error_phase(exc)
         if phase is not None:
             attrs["error_phase"] = phase.value
