@@ -5790,6 +5790,114 @@ async def test_handle_import_local_unexpected_error_skips_only_that_session(
     assert done_frames[0].status == "ok" and done_frames[0].failed == 1
 
 
+async def test_handle_import_local_send_failure_skips_only_that_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-ConnectionClosed error while sending one session frame is skipped.
+
+    Encoding/sending one session can fail (e.g. a bad payload TypeError) without
+    the tunnel being dead; that session must be counted and skipped, not abort
+    the batch.
+    """
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "before"), ("claude", "bad"), ("claude", "after")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="ok",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            frame = decode_host_frame(text)
+            if (
+                isinstance(frame, HostImportLocalSessionFrame)
+                and frame.session.external_session_id == "bad"
+            ):
+                raise TypeError("frame not serializable")
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_send", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # The send that raised is skipped; the other two sessions still stream and
+    # the batch closes ok with the failed one counted.
+    assert [f.session.external_session_id for f in session_frames] == ["after", "before"]
+    assert len(done_frames) == 1
+    assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+
+
+async def test_handle_import_local_send_connection_closed_aborts_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead tunnel (ConnectionClosed) on send aborts, never a per-session skip."""
+    host = _make_host_process()
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "s1"), ("claude", "s2")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="ok",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            raise ConnectionClosedError(None, None)
+
+    # Propagates so _run_frame_handler owns reconnect; it is not swallowed as a
+    # skipped session nor turned into a status="failed" done frame.
+    with pytest.raises(ConnectionClosedError):
+        await host._handle_import_local(
+            _FakeWs(),  # type: ignore[arg-type]
+            HostImportLocalFrame(request_id="req_cc", source="all", limit=5),
+        )
+
+
 async def test_dispatch_fs_write_op_routes_github_set_preference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
